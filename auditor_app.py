@@ -74,6 +74,14 @@ def fetch_agents(el_key):
     data = api_req("https://api.elevenlabs.io/v1/convai/agents?page_size=50", {"xi-api-key": el_key})
     return data.get("agents", [])
 
+def fetch_agent_prompt(el_key, agent_id):
+    try:
+        data = api_req(f"https://api.elevenlabs.io/v1/convai/agents/{agent_id}", {"xi-api-key": el_key})
+        prompt = data.get("conversation_config", {}).get("agent", {}).get("prompt", {}).get("prompt", "")
+        return prompt
+    except:
+        return ""
+
 def fetch_conversations(el_key, agent_id, page_size, cursor=None):
     url = f"https://api.elevenlabs.io/v1/convai/conversations?page_size={page_size}"
     if agent_id: url += f"&agent_id={agent_id}"
@@ -180,25 +188,40 @@ with st.sidebar:
             st.session_state.agent_name = opts[sel]
             st.session_state.conversations = []
             st.session_state.loaded = False
+            # Auto-cargar prompt del agente
+            if sel and sel not in st.session_state.agent_context:
+                with st.spinner("Leyendo prompt del agente..."):
+                    prompt = fetch_agent_prompt(el_key, sel)
+                    if prompt:
+                        st.session_state.agent_context[sel] = prompt
             st.rerun()
 
         # ── Contexto / objetivo del agente ──
         if sel:
             st.divider()
-            st.markdown("**🎯 Objetivo del agente:**")
-            st.markdown("<div style='font-size:11px;color:#9e9e9a;margin-bottom:6px;'>Describe qué debe lograr este agente. Claude usará esto para evaluar el score.</div>", unsafe_allow_html=True)
+            st.markdown("**🎯 Prompt del agente:**")
+            st.markdown("<div style='font-size:11px;color:#9e9e9a;margin-bottom:6px;'>Cargado automáticamente desde ElevenLabs. Puedes editarlo si quieres ajustar el criterio de evaluación.</div>", unsafe_allow_html=True)
             ctx_key = f"ctx_{sel}"
             current_ctx = st.session_state.agent_context.get(sel, "")
             new_ctx = st.text_area(
-                "Objetivo",
+                "Prompt",
                 value=current_ctx,
-                placeholder="Ej: El objetivo es recopilar el nombre del usuario y transferirlo a un asesor por WhatsApp. Si el agente cumplió ese flujo, es éxito independientemente de si el usuario aceptó.",
-                height=120,
+                placeholder="Se cargará automáticamente al seleccionar el agente, o escribe el objetivo manualmente.",
+                height=150,
                 label_visibility="collapsed",
                 key=ctx_key
             )
             if new_ctx != current_ctx:
                 st.session_state.agent_context[sel] = new_ctx
+            if st.button("🔄 Recargar prompt", use_container_width=True):
+                with st.spinner("Leyendo prompt..."):
+                    prompt = fetch_agent_prompt(el_key, sel)
+                    if prompt:
+                        st.session_state.agent_context[sel] = prompt
+                        st.success("✓ Prompt actualizado")
+                        st.rerun()
+                    else:
+                        st.warning("No se encontró prompt para este agente.")
 
     st.divider()
     st.markdown("**Lo que se evalúa:**\n- 🤖 Clasificación\n- ⭐ Score 0–10\n- `{{` Errores de template `}}`\n- 👤 Errores de nombre\n- 🔍 Issues\n- 💡 Recomendaciones")
