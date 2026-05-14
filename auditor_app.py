@@ -26,19 +26,30 @@ st.markdown("""
   .score-low  { color: #791F1F; font-weight: 700; }
   .issue-tag  { display: inline-block; background: #f5f5f3; border: 1px solid #d3d1c7; color: #6b6b67; font-size: 11px; padding: 2px 8px; border-radius: 20px; margin: 2px; }
   .rec-item   { font-size: 13px; color: #6b6b67; padding: 4px 0 4px 12px; border-left: 2px solid #EF9F27; margin-bottom: 4px; }
-  .resumo     { font-size: 14px; color: #1a1a18; line-height: 1.6; margin-bottom: 12px; }
+  /* Fix dark mode: force readable text color */
+  .resumo { font-size: 14px; color: var(--text-color, #1a1a18); line-height: 1.6; margin-bottom: 12px; }
+  @media (prefers-color-scheme: dark) { .resumo { color: #f0f0ee; } }
   h1 { font-size: 24px !important; }
+  .context-box { background: #FAEEDA; border-left: 3px solid #EF9F27; border-radius: 6px; padding: 10px 14px; font-size: 12px; color: #633806; margin-bottom: 8px; }
 </style>
 """, unsafe_allow_html=True)
 
-AUDIT_SYSTEM = """Eres un auditor experto de agentes de voz para call centers. Analiza la transcripción y devuelve SOLO JSON válido, sin markdown, sin texto extra.
+BASE_AUDIT_SYSTEM = """Eres un auditor experto de agentes de voz para call centers. Analiza la transcripción y devuelve SOLO JSON válido, sin markdown, sin texto extra.
 
 Formato exacto:
-{"clasificacion":"resuelta|no_resuelta|escalada|error_tecnico|abandonada","score":8,"template_errors":false,"name_errors":false,"issues":["issue 1"],"resumen":"Resumen en 1-2 frases.","recomendaciones":["Recomendación 1"]}
+{{"clasificacion":"resuelta|no_resuelta|escalada|error_tecnico|abandonada","score":8,"template_errors":false,"name_errors":false,"issues":["issue 1"],"resumen":"Resumen en 1-2 frases.","recomendaciones":["Recomendación 1"]}}
 
-Criterios: resuelta=objetivo cumplido, no_resuelta=no se logró, escalada=transferido a humano, error_tecnico=falla del sistema, abandonada=usuario colgó. Score 0-10. template_errors=true si hay {{variable}} sin reemplazar. name_errors=true si hay problemas con nombres."""
+Criterios base: resuelta=objetivo cumplido, no_resuelta=no se logró, escalada=transferido a humano, error_tecnico=falla del sistema, abandonada=usuario colgó. Score 0-10. template_errors=true si hay {{{{variable}}}} sin reemplazar. name_errors=true si hay problemas con nombres.
 
-# ── Leer API Keys desde Streamlit Secrets o variables de entorno ──
+{context_block}"""
+
+def build_system_prompt(agent_context):
+    if agent_context and agent_context.strip():
+        context_block = f"OBJETIVO ESPECÍFICO DE ESTE AGENTE (úsalo como criterio principal para el score y clasificación):\n{agent_context.strip()}"
+    else:
+        context_block = ""
+    return BASE_AUDIT_SYSTEM.format(context_block=context_block)
+
 def get_secret(key):
     try:
         return st.secrets[key]
@@ -74,14 +85,15 @@ def fetch_transcript(el_key, conv_id):
     data = api_req(f"https://api.elevenlabs.io/v1/convai/conversations/{conv_id}", {"xi-api-key": el_key})
     return data.get("transcript", [])
 
-def audit_claude(ant_key, transcript):
+def audit_claude(ant_key, transcript, agent_context=""):
     if not transcript:
         return {"clasificacion":"abandonada","score":0,"template_errors":False,"name_errors":False,
                 "issues":["Transcripción vacía"],"resumen":"Sin contenido.","recomendaciones":[]}
     tx = "\n".join(f"{'Agente' if t['role']=='agent' else 'Usuario'}: {t['message']}" for t in transcript)
+    system = build_system_prompt(agent_context)
     data = api_req("https://api.anthropic.com/v1/messages",
         {"Content-Type":"application/json","x-api-key":ant_key,"anthropic-version":"2023-06-01"},
-        {"model":"claude-sonnet-4-5","max_tokens":1000,"system":AUDIT_SYSTEM,
+        {"model":"claude-sonnet-4-5","max_tokens":1000,"system":system,
          "messages":[{"role":"user","content":f"Audita esta llamada:\n\n{tx}"}]})
     text = "".join(b["text"] for b in data.get("content",[]) if b["type"]=="text")
     return json.loads(text.replace("```json","").replace("```","").strip())
@@ -100,7 +112,7 @@ def to_csv(rows):
 # ── Session state ─────────────────────────────────────────────
 for k,v in {"agents":[],"conversations":[],"selected_ids":set(),"audit_results":{},
             "transcripts":{},"loaded":False,"agent_id":"","agent_name":"Todos",
-            "has_more":False,"cursor":None}.items():
+            "has_more":False,"cursor":None,"agent_context":{}}.items():
     if k not in st.session_state: st.session_state[k] = v
 
 PILL = {"resuelta":"resuelta","no_resuelta":"no resuelta","escalada":"escalada",
@@ -112,14 +124,13 @@ with st.sidebar:
     st.markdown("*ElevenLabs × Claude AI*")
     st.divider()
 
-    # Si hay secrets configuradas, no muestra los campos
     if EL_KEY_DEFAULT and ANT_KEY_DEFAULT:
         el_key  = EL_KEY_DEFAULT
         ant_key = ANT_KEY_DEFAULT
         st.success("🔐 API Keys configuradas")
     else:
-        el_key  = st.text_input("API Key de ElevenLabs",  type="password", placeholder="xi-...")
-        ant_key = st.text_input("API Key de Anthropic",   type="password", placeholder="sk-ant-...")
+        el_key  = st.text_input("API Key de ElevenLabs", type="password", placeholder="xi-...")
+        ant_key = st.text_input("API Key de Anthropic",  type="password", placeholder="sk-ant-...")
 
     st.divider()
     page_size = st.slider("Llamadas por carga", 10, 100, 30, 10)
@@ -171,6 +182,24 @@ with st.sidebar:
             st.session_state.loaded = False
             st.rerun()
 
+        # ── Contexto / objetivo del agente ──
+        if sel:
+            st.divider()
+            st.markdown("**🎯 Objetivo del agente:**")
+            st.markdown("<div style='font-size:11px;color:#9e9e9a;margin-bottom:6px;'>Describe qué debe lograr este agente. Claude usará esto para evaluar el score.</div>", unsafe_allow_html=True)
+            ctx_key = f"ctx_{sel}"
+            current_ctx = st.session_state.agent_context.get(sel, "")
+            new_ctx = st.text_area(
+                "Objetivo",
+                value=current_ctx,
+                placeholder="Ej: El objetivo es recopilar el nombre del usuario y transferirlo a un asesor por WhatsApp. Si el agente cumplió ese flujo, es éxito independientemente de si el usuario aceptó.",
+                height=120,
+                label_visibility="collapsed",
+                key=ctx_key
+            )
+            if new_ctx != current_ctx:
+                st.session_state.agent_context[sel] = new_ctx
+
     st.divider()
     st.markdown("**Lo que se evalúa:**\n- 🤖 Clasificación\n- ⭐ Score 0–10\n- `{{` Errores de template `}}`\n- 👤 Errores de nombre\n- 🔍 Issues\n- 💡 Recomendaciones")
 
@@ -188,6 +217,11 @@ tab1, tab2 = st.tabs([f"📋 Llamadas ({len(convs)})", "📊 Resultados"])
 with tab1:
     st.markdown(f"**Agente:** {st.session_state.agent_name} &nbsp;·&nbsp; **{len(convs)} conversaciones**")
 
+    # Mostrar contexto activo si existe
+    ctx = st.session_state.agent_context.get(st.session_state.agent_id, "")
+    if ctx:
+        st.markdown(f'<div class="context-box">🎯 <strong>Objetivo activo:</strong> {ctx}</div>', unsafe_allow_html=True)
+
     c1, c2 = st.columns([2, 2])
     with c1:
         if st.button("✅ Seleccionar todas", use_container_width=True):
@@ -199,14 +233,12 @@ with tab1:
     with c2:
         if st.button("☐ Deseleccionar", use_container_width=True):
             for c in convs:
-                cid = c["conversation_id"]
-                st.session_state[f"chk_{cid}"] = False
+                st.session_state[f"chk_{c['conversation_id']}"] = False
             st.session_state.selected_ids.clear()
             st.rerun()
 
     st.divider()
 
-    # ── Checkboxes com estado persistente ──
     for conv in convs:
         cid = conv["conversation_id"]
         agent_tag = f"🤖 `{conv.get('agent_id','')[:20]}`&nbsp;" if not st.session_state.agent_id else ""
@@ -222,10 +254,7 @@ with tab1:
             else:
                 st.session_state.selected_ids.discard(cid)
         with col_info:
-            st.markdown(
-                f"`{cid}` &nbsp; {agent_tag}🕐 {dur} &nbsp; 📅 {dt} &nbsp; 💬 {msgs} msgs",
-                unsafe_allow_html=True
-            )
+            st.markdown(f"`{cid}` &nbsp; {agent_tag}🕐 {dur} &nbsp; 📅 {dt} &nbsp; 💬 {msgs} msgs", unsafe_allow_html=True)
 
     if st.session_state.has_more:
         st.info("Hay más llamadas. Usa **+ Más** en la barra lateral.")
@@ -241,6 +270,7 @@ with tab1:
 
     if go and n > 0:
         ids = list(st.session_state.selected_ids)
+        agent_ctx = st.session_state.agent_context.get(st.session_state.agent_id, "")
         prog = st.progress(0, text="Iniciando auditoría...")
         st.session_state.audit_results = {}
         for i, cid in enumerate(ids):
@@ -248,7 +278,7 @@ with tab1:
             try:
                 tx = fetch_transcript(el_key, cid)
                 st.session_state.transcripts[cid] = tx
-                r = audit_claude(ant_key, tx)
+                r = audit_claude(ant_key, tx, agent_ctx)
                 r["agent_id"] = next((c for c in convs if c["conversation_id"]==cid), {}).get("agent_id","")
                 st.session_state.audit_results[cid] = {"status":"done", **r}
             except Exception as e:
@@ -302,8 +332,9 @@ with tab2:
         ])
 
         with st.expander(f"Score {score}/10 — {PILL.get(clf,clf)}  •  {cid[:38]}  •  {dur}"):
-            st.markdown(f"""<p class="resumo">{r.get('resumen','')}</p>
-<div><span class="pill pill-{clf}">{PILL.get(clf,clf)}</span> &nbsp;
+            # Resumo com st.write para garantir legibilidade no dark mode
+            st.write(r.get("resumen",""))
+            st.markdown(f"""<div><span class="pill pill-{clf}">{PILL.get(clf,clf)}</span> &nbsp;
 <span class="{score_cls(score)}">{score}/10</span> &nbsp; {warn} &nbsp; 🕐 {dur} &nbsp; 📅 {dt}</div>
 """, unsafe_allow_html=True)
             if r.get("issues"):
