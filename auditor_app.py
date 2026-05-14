@@ -38,6 +38,16 @@ Formato exacto:
 
 Criterios: resuelta=objetivo cumplido, no_resuelta=no se logró, escalada=transferido a humano, error_tecnico=falla del sistema, abandonada=usuario colgó. Score 0-10. template_errors=true si hay {{variable}} sin reemplazar. name_errors=true si hay problemas con nombres."""
 
+# ── Leer API Keys desde Streamlit Secrets o variables de entorno ──
+def get_secret(key):
+    try:
+        return st.secrets[key]
+    except:
+        return ""
+
+EL_KEY_DEFAULT  = get_secret("EL_KEY")
+ANT_KEY_DEFAULT = get_secret("ANT_KEY")
+
 def api_req(url, headers, body=None):
     req = Request(url, headers=headers)
     if body:
@@ -82,11 +92,12 @@ def score_cls(s): return "score-high" if s>=7 else "score-mid" if s>=5 else "sco
 
 def to_csv(rows):
     buf = io.StringIO(); buf.write("\ufeff")
-    w = csv.DictWriter(buf, fieldnames=["id","agente","fecha","duracion","clasificacion","score","error_template","error_nombre","resumen","issues","recomendaciones"])
+    w = csv.DictWriter(buf, fieldnames=["id","agente","fecha","duracion","clasificacion","score",
+        "error_template","error_nombre","resumen","issues","recomendaciones"])
     w.writeheader(); [w.writerow(r) for r in rows]
     return buf.getvalue()
 
-# Session state
+# ── Session state ─────────────────────────────────────────────
 for k,v in {"agents":[],"conversations":[],"selected_ids":set(),"audit_results":{},
             "transcripts":{},"loaded":False,"agent_id":"","agent_name":"Todos",
             "has_more":False,"cursor":None}.items():
@@ -100,8 +111,16 @@ with st.sidebar:
     st.markdown("## 🎙️ Auditor de Smartons")
     st.markdown("*ElevenLabs × Claude AI*")
     st.divider()
-    el_key  = st.text_input("API Key de ElevenLabs",  type="password", placeholder="xi-...")
-    ant_key = st.text_input("API Key de Anthropic",   type="password", placeholder="sk-ant-...")
+
+    # Si hay secrets configuradas, no muestra los campos
+    if EL_KEY_DEFAULT and ANT_KEY_DEFAULT:
+        el_key  = EL_KEY_DEFAULT
+        ant_key = ANT_KEY_DEFAULT
+        st.success("🔐 API Keys configuradas")
+    else:
+        el_key  = st.text_input("API Key de ElevenLabs",  type="password", placeholder="xi-...")
+        ant_key = st.text_input("API Key de Anthropic",   type="password", placeholder="sk-ant-...")
+
     st.divider()
     page_size = st.slider("Llamadas por carga", 10, 100, 30, 10)
 
@@ -109,8 +128,7 @@ with st.sidebar:
     with c1:
         load = st.button("🔄 Cargar", use_container_width=True, type="primary")
     with c2:
-        more_btn = st.button("+ Más", use_container_width=True,
-                             disabled=not st.session_state.has_more)
+        more_btn = st.button("+ Más", use_container_width=True, disabled=not st.session_state.has_more)
 
     if load:
         if not el_key or not ant_key:
@@ -160,50 +178,65 @@ with st.sidebar:
 st.title("Auditor de Smartons")
 
 if not st.session_state.loaded:
-    st.info("👈 Ingresa las API Keys y haz clic en **Cargar** para comenzar.")
+    st.info("👈 Haz clic en **Cargar** para comenzar.")
     st.stop()
 
 convs = st.session_state.conversations
 tab1, tab2 = st.tabs([f"📋 Llamadas ({len(convs)})", "📊 Resultados"])
 
+# ── TAB 1 ─────────────────────────────────────────────────────
 with tab1:
     st.markdown(f"**Agente:** {st.session_state.agent_name} &nbsp;·&nbsp; **{len(convs)} conversaciones**")
-    c1, c2 = st.columns([2,2])
+
+    c1, c2 = st.columns([2, 2])
     with c1:
-        if st.button("✅ Seleccionar todas"):
-            st.session_state.selected_ids = {c["conversation_id"] for c in convs}; st.rerun()
+        if st.button("✅ Seleccionar todas", use_container_width=True):
+            for c in convs:
+                st.session_state.selected_ids.add(c["conversation_id"])
+            st.rerun()
     with c2:
-        if st.button("☐ Deseleccionar"):
-            st.session_state.selected_ids = set(); st.rerun()
+        if st.button("☐ Deseleccionar", use_container_width=True):
+            st.session_state.selected_ids.clear()
+            st.rerun()
+
     st.divider()
 
+    # ── Checkboxes com estado persistente ──
     for conv in convs:
         cid = conv["conversation_id"]
-        checked = cid in st.session_state.selected_ids
-        ca, cb = st.columns([0.5, 9.5])
-        with ca:
-            v = st.checkbox("", value=checked, key=f"c_{cid}")
-            if v != checked:
-                if v: st.session_state.selected_ids.add(cid)
-                else: st.session_state.selected_ids.discard(cid)
-        with cb:
-            agent_tag = f"🤖 `{conv.get('agent_id','')[:20]}`&nbsp;" if not st.session_state.agent_id else ""
-            st.markdown(f"`{cid}` &nbsp; {agent_tag}🕐 {fmt_dur(conv.get('call_duration_secs'))} &nbsp; 📅 {fmt_dt(conv.get('start_time_unix_secs'))} &nbsp; 💬 {conv.get('message_count','?')} msgs", unsafe_allow_html=True)
+        agent_tag = f"🤖 `{conv.get('agent_id','')[:20]}`&nbsp;" if not st.session_state.agent_id else ""
+        dur = fmt_dur(conv.get("call_duration_secs"))
+        dt  = fmt_dt(conv.get("start_time_unix_secs"))
+        msgs = conv.get("message_count", "?")
+
+        col_chk, col_info = st.columns([0.5, 9.5])
+        with col_chk:
+            checked = cid in st.session_state.selected_ids
+            if st.checkbox("", value=checked, key=f"chk_{cid}"):
+                st.session_state.selected_ids.add(cid)
+            else:
+                st.session_state.selected_ids.discard(cid)
+        with col_info:
+            st.markdown(
+                f"`{cid}` &nbsp; {agent_tag}🕐 {dur} &nbsp; 📅 {dt} &nbsp; 💬 {msgs} msgs",
+                unsafe_allow_html=True
+            )
 
     if st.session_state.has_more:
         st.info("Hay más llamadas. Usa **+ Más** en la barra lateral.")
 
     st.divider()
     n = len(st.session_state.selected_ids)
-    ca, cb = st.columns([2,8])
+    ca, cb = st.columns([2, 8])
     with ca:
-        go = st.button(f"▶ Auditar {n} llamada{'s' if n!=1 else ''}", disabled=n==0, type="primary", use_container_width=True)
+        go = st.button(f"▶ Auditar {n} llamada{'s' if n!=1 else ''}",
+                       disabled=n==0, type="primary", use_container_width=True)
     with cb:
         if n > 0: st.markdown(f"*{n} llamadas seleccionadas*")
 
     if go and n > 0:
         ids = list(st.session_state.selected_ids)
-        prog = st.progress(0, text="Iniciando...")
+        prog = st.progress(0, text="Iniciando auditoría...")
         st.session_state.audit_results = {}
         for i, cid in enumerate(ids):
             prog.progress(i/len(ids), text=f"Evaluando {i+1}/{len(ids)}: `{cid[:35]}...`")
@@ -220,16 +253,17 @@ with tab1:
         st.balloons()
         st.info("👉 Revisa los resultados en la pestaña **Resultados**.")
 
+# ── TAB 2 ─────────────────────────────────────────────────────
 with tab2:
     res = {k:v for k,v in st.session_state.audit_results.items() if v.get("status")=="done"}
     if not res:
         st.info("Ninguna auditoría realizada aún."); st.stop()
 
     done = list(res.values())
-    avg = sum(r.get("score",0) for r in done)/len(done)
-    resueltas = sum(1 for r in done if r.get("clasificacion")=="resuelta")
+    avg  = sum(r.get("score",0) for r in done)/len(done)
+    resueltas    = sum(1 for r in done if r.get("clasificacion")=="resuelta")
     issues_count = sum(1 for r in done if r.get("issues"))
-    tpl = sum(1 for r in done if r.get("template_errors"))
+    tpl          = sum(1 for r in done if r.get("template_errors"))
 
     st.markdown(f"""<div class="metric-row">
       <div class="metric-box"><div class="label">Score promedio</div><div class="value">{avg:.1f}</div><div class="sub">de 10</div></div>
@@ -244,7 +278,8 @@ with tab2:
     with ca: filt = st.selectbox("Filtrar:", list(FL.keys()), format_func=lambda x: FL[x])
     with cb:
         agents_in = list(set(r.get("agent_id","") for r in done if r.get("agent_id")))
-        af = st.selectbox("Agente:", ["todos"]+agents_in, format_func=lambda x: "— Todos —" if x=="todos" else x) if len(agents_in)>1 else "todos"
+        af = st.selectbox("Agente:", ["todos"]+agents_in,
+             format_func=lambda x: "— Todos —" if x=="todos" else x) if len(agents_in)>1 else "todos"
 
     csv_rows = []
     for cid, r in res.items():
@@ -252,12 +287,14 @@ with tab2:
         if filt!="todas" and clf!=filt: continue
         if af!="todos" and r.get("agent_id","")!=af: continue
 
-        conv = next((c for c in convs if c["conversation_id"]==cid), {})
-        dur = fmt_dur(conv.get("call_duration_secs"))
-        dt  = fmt_dt(conv.get("start_time_unix_secs"))
+        conv  = next((c for c in convs if c["conversation_id"]==cid), {})
+        dur   = fmt_dur(conv.get("call_duration_secs"))
+        dt    = fmt_dt(conv.get("start_time_unix_secs"))
         score = r.get("score",0)
-        warn = (''.join(['<span class="pill pill-warn">⚠ template</span> ' if r.get("template_errors") else "",
-                         '<span class="pill pill-warn">⚠ nombre</span>' if r.get("name_errors") else ""]))
+        warn  = "".join([
+            '<span class="pill pill-warn">⚠ template</span> ' if r.get("template_errors") else "",
+            '<span class="pill pill-warn">⚠ nombre</span>'    if r.get("name_errors")     else ""
+        ])
 
         with st.expander(f"Score {score}/10 — {PILL.get(clf,clf)}  •  {cid[:38]}  •  {dur}"):
             st.markdown(f"""<p class="resumo">{r.get('resumen','')}</p>
