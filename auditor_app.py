@@ -365,7 +365,8 @@ with tab2:
                 st.markdown(" ".join(f'<span class="issue-tag">⚠ {i}</span>' for i in r["issues"]), unsafe_allow_html=True)
             if r.get("recomendaciones"):
                 st.markdown("**Recomendaciones:**")
-                [st.markdown(f'<div class="rec-item">{rc}</div>', unsafe_allow_html=True) for rc in r["recomendaciones"]]
+                for rc in r["recomendaciones"]:
+                    st.markdown(f'<div class="rec-item">{rc}</div>', unsafe_allow_html=True)
             tx = st.session_state.transcripts.get(cid,[])
             if tx:
                 with st.expander("Ver transcripción"):
