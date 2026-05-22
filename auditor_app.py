@@ -58,7 +58,9 @@ VOICE_AUDIT_SYSTEM = """Eres un auditor experto de calidad de voz para agentes d
 Analiza esta transcripción enriquecida y devuelve SOLO JSON válido, sin markdown, sin texto extra.
 
 Formato exacto:
-{{"generative_voice_score":8,"conversational_flow_score":7,"interruption_score":9,"background_noise_level":"limpio|leve|moderado|alto","noise_confused_with_voice":false,"premature_termination":false,"voice_qa_reasoning":"2-3 frases justificando los scores."}}
+{{"generative_voice_score":8,"conversational_flow_score":7,"interruption_score":9,"background_noise_level":"limpio|leve|moderado|alto","noise_confused_with_voice":false,"premature_termination":false,"user_sentiment":"satisfecho|neutro|frustrado|confuso|molesto","voice_qa_reasoning":"2-3 frases justificando los scores."}}
+
+- user_sentiment: estado emocional del usuario durante la llamada basado en el tono, velocidad del habla, pausas y palabras usadas.
 
 Criterios:
 - generative_voice_score (1-10): Penaliza artefactos artificiales, velocidad robótica, slips al español castillano.
@@ -231,6 +233,53 @@ def audit_voice_claude(ant_key, scribe_result):
         return {"error": str(e)}
 
 def fmt_dur(s): return f"{int(s)//60}m {int(s)%60}s" if s else "—"
+
+def content_alert_emoji(score, clf, r):
+    """🔴🟡🟢 based on content quality: score, classification, template errors."""
+    if r.get("template_errors") or r.get("name_errors") or clf == "error_tecnico":
+        return "🔴"
+    if score <= 4 or clf == "no_resuelta":
+        return "🔴"
+    if score <= 6:
+        return "🟡"
+    return "🟢"
+
+def audio_alert_emoji(voice):
+    """🎙️ badge for audio/voice quality issues — separate from content."""
+    if not voice or voice.get("error"):
+        return ""
+    critical = (
+        voice.get("noise_confused_with_voice") or
+        voice.get("premature_termination") or
+        (isinstance(voice.get("generative_voice_score"), int) and voice["generative_voice_score"] <= 4) or
+        voice.get("background_noise_level") == "alto"
+    )
+    warning = (
+        (isinstance(voice.get("generative_voice_score"), int) and voice["generative_voice_score"] <= 6) or
+        (isinstance(voice.get("conversational_flow_score"), int) and voice["conversational_flow_score"] <= 5) or
+        (isinstance(voice.get("interruption_score"), int) and voice["interruption_score"] <= 5) or
+        voice.get("background_noise_level") == "moderado"
+    )
+    if critical: return "🎙️🔴"
+    if warning:  return "🎙️🟡"
+    return "🎙️🟢"
+
+def sentiment_emoji(sentiment):
+    return {
+        "satisfecho": "😊",
+        "neutro": "😐",
+        "frustrado": "😤",
+        "confuso": "😕",
+        "molesto": "😠"
+    }.get(sentiment, "")
+
+def noise_badge(level):
+    return {
+        "limpio": "🔇 limpio",
+        "leve":   "🔉 leve",
+        "moderado": "🔊 moderado",
+        "alto":   "📢 alto"
+    }.get(level, level)
 def fmt_dt(ts): return datetime.fromtimestamp(ts).strftime("%d/%m %H:%M") if ts else "—"
 def score_cls(s): return "score-high" if s>=7 else "score-mid" if s>=5 else "score-low"
 
@@ -239,7 +288,7 @@ def to_csv(rows):
     fields = ["id","agente","fecha","duracion","clasificacion","score",
               "error_template","error_nombre","resumen","issues","recomendaciones",
               "voz_generativa","flujo_conversacional","interrupciones","ruido_fondo",
-              "ruido_confundido_voz","terminacion_prematura","qa_voz"]
+              "ruido_confundido_voz","terminacion_prematura","qa_voz","sentimiento"]
     w = csv.DictWriter(buf, fieldnames=fields)
     w.writeheader()
     for r in rows: w.writerow(r)
@@ -523,7 +572,15 @@ with tab2:
             '<span class="audio-badge">🎵 Scribe</span>'      if has_voice else ""
         ])
 
-        with st.expander(f"Score {score}/10 — {PILL.get(clf,clf)}  •  {cid[:38]}  •  {dur}"):
+        content_alert = content_alert_emoji(score, clf, r)
+        audio_alert = audio_alert_emoji(voice) if has_voice else ""
+        sentiment = voice.get("user_sentiment","") if has_voice else ""
+        sent_icon = sentiment_emoji(sentiment)
+        noise_lvl = voice.get("background_noise_level","") if has_voice else ""
+        noise_info = f"  {noise_badge(noise_lvl)}" if noise_lvl and noise_lvl != "limpio" else ""
+        audio_section = f"  |  {audio_alert}{noise_info}{' ' + sent_icon if sent_icon else ''}" if has_voice else ""
+        title = f"{content_alert} Score {score}/10 — {PILL.get(clf,clf)}  •  {cid[:28]}  •  {dur}{audio_section}"
+        with st.expander(title.strip()):
             st.write(r.get("resumen",""))
             st.markdown(f"""<div><span class="pill pill-{clf}">{PILL.get(clf,clf)}</span> &nbsp;
 <span class="{score_cls(score)}">{score}/10</span> &nbsp; {warn} &nbsp; 🕐 {dur} &nbsp; 📅 {dt}</div>
@@ -568,6 +625,7 @@ with tab2:
   <div class="voice-metric"><span class="vm-label">Ruido de fondo</span><span class="vm-val">{vn}</span></div>
   <div class="voice-metric"><span class="vm-label">Ruido confundido con voz</span><span class="vm-val">{vnc}</span></div>
   <div class="voice-metric"><span class="vm-label">Terminación prematura</span><span class="vm-val">{vpt}</span></div>
+  <div class="voice-metric"><span class="vm-label">Sentimiento del usuario</span><span class="vm-val">{sent_icon} {sentiment}</span></div>
   {"<div style='font-size:12px;color:#6b6b67;margin-top:8px;'>" + vqa + "</div>" if vqa else ""}
 </div>""", unsafe_allow_html=True)
 
@@ -604,7 +662,8 @@ with tab2:
             "ruido_fondo": voice.get("background_noise_level","") if has_voice else "",
             "ruido_confundido_voz": "sí" if has_voice and voice.get("noise_confused_with_voice") else "no" if has_voice else "",
             "terminacion_prematura": "sí" if has_voice and voice.get("premature_termination") else "no" if has_voice else "",
-            "qa_voz": voice.get("voice_qa_reasoning","") if has_voice else ""
+            "qa_voz": voice.get("voice_qa_reasoning","") if has_voice else "",
+            "sentimiento": voice.get("user_sentiment","") if has_voice else ""
         })
 
     if csv_rows:
