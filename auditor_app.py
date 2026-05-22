@@ -162,13 +162,15 @@ def transcribe_with_scribe(el_key, audio_bytes):
         body += audio_bytes + CRLF
         body += f"--{boundary}--\r\n".encode()
 
+        url = f"https://api.elevenlabs.io/v1/speech-to-text"
         req = urllib.request.Request(
-            "https://api.elevenlabs.io/v1/speech-to-text",
+            url,
             data=body,
             headers={
                 "xi-api-key": el_key,
                 "Content-Type": f"multipart/form-data; boundary={boundary}",
-                "Accept": "application/json"
+                "Accept": "application/json",
+                "User-Agent": "Mozilla/5.0"
             },
             method="POST"
         )
@@ -462,32 +464,37 @@ with tab1:
             else:
                 st.session_state.selected_ids.discard(cid)
         with col_info:
-            # Pre-audit visual indicators
             secs = conv.get("call_duration_secs") or 0
             msg_count = conv.get("message_count") or 0
             pre_flags = []
             if msg_count == 0:
-                pre_flags.append("⚠️ sin mensajes")
+                pre_flags.append(("⚠️", "sin mensajes", "#5c3a00", "#FAEEDA"))
             elif msg_count <= 2:
-                pre_flags.append("💬 muy corta")
+                pre_flags.append(("💬", "muy corta", "#4a4a48", "#2a2a28"))
             if secs > 0 and secs < 20:
-                pre_flags.append("⏱️ <20s")
+                pre_flags.append(("⏱️", "<20s", "#4a4a48", "#2a2a28"))
             elif secs > 300:
-                pre_flags.append("⏱️ +5min")
-            flags_html = " ".join(f'<span style="font-size:10px;background:#2a2a28;padding:2px 6px;border-radius:10px;color:#9e9e9a;">{f}</span>' for f in pre_flags)
-            # If already audited, show result badge
+                pre_flags.append(("⏱️", "+5min", "#4a4a48", "#2a2a28"))
+
             audit = st.session_state.audit_results.get(cid)
             if audit and audit.get("status") == "done":
                 sc = audit.get("score", 0)
                 cl = audit.get("clasificacion", "")
-                voice = audit.get("voice") or {}
+                voice_r = audit.get("voice") or {}
                 ca = content_alert_emoji(sc, cl, audit)
-                aa = audio_alert_emoji(voice) if voice and not voice.get("error") else ""
-                result_badge = f'<span style="font-size:11px;font-weight:600;">{ca} {sc}/10</span> {aa}'
+                aa = audio_alert_emoji(voice_r) if voice_r and not voice_r.get("error") else ""
+                result_badge = f'<span style="font-size:12px;font-weight:700;margin-right:6px;">{ca} {sc}/10 {aa}</span>'
             else:
                 result_badge = ""
+
+            flags_html = " ".join(
+                f'<span style="font-size:10px;background:{bg};color:{fc};padding:2px 7px;border-radius:10px;font-weight:600;">{icon} {label}</span>'
+                for icon, label, fc, bg in pre_flags
+            )
+            left_badges = (result_badge + " " + flags_html).strip()
+
             st.markdown(
-                f"`{cid}` &nbsp; {agent_tag}🕐 {dur} &nbsp; 📅 {dt} &nbsp; 💬 {msgs} msgs &nbsp; {flags_html} &nbsp; {result_badge}",
+                f"{left_badges}&nbsp; `{cid}` &nbsp; {agent_tag}🕐 {dur} &nbsp; 📅 {dt} &nbsp; 💬 {msgs} msgs",
                 unsafe_allow_html=True
             )
 
@@ -653,13 +660,13 @@ with tab2:
                     bg    = PRIO_BG.get(prio, "#FAEEDA")
                     icon  = PRIO_ICON.get(prio, "🟡")
                     rows_html += f'''<tr>
-                        <td style="padding:6px 10px;font-size:11px;font-weight:700;background:{bg};color:{color};border-radius:4px;white-space:nowrap;">{icon} {prio.upper()}</td>
-                        <td style="padding:6px 10px;font-size:12px;color:var(--text-color,#1a1a18);">{texto}</td>
+                        <td style="padding:6px 10px;font-size:11px;font-weight:700;background:{bg};color:{color};border-radius:4px;white-space:nowrap;vertical-align:top;">{icon} {prio.upper()}</td>
+                        <td style="padding:6px 10px;font-size:12px;color:#e0e0de;vertical-align:top;">{texto}</td>
                     </tr>'''
-                st.markdown(f'''<table style="width:100%;border-collapse:separate;border-spacing:0 4px;">
-                    <thead><tr>
-                        <th style="font-size:10px;color:#9e9e9a;text-align:left;padding:0 10px;width:80px;">PRIORIDAD</th>
-                        <th style="font-size:10px;color:#9e9e9a;text-align:left;padding:0 10px;">RECOMENDACIÓN</th>
+                st.markdown(f'''<table style="width:100%;border-collapse:separate;border-spacing:0 4px;background:#1e1e1c;border-radius:8px;overflow:hidden;">
+                    <thead><tr style="background:#2a2a28;">
+                        <th style="font-size:10px;color:#9e9e9a;text-align:left;padding:6px 10px;width:90px;">PRIORIDAD</th>
+                        <th style="font-size:10px;color:#9e9e9a;text-align:left;padding:6px 10px;">RECOMENDACIÓN</th>
                     </tr></thead>
                     <tbody>{rows_html}</tbody>
                 </table>''', unsafe_allow_html=True)
