@@ -47,7 +47,9 @@ st.markdown("""
 BASE_AUDIT_SYSTEM = """Eres un auditor experto de agentes de voz para call centers LATAM. Analiza la transcripción y devuelve SOLO JSON válido, sin markdown, sin texto extra.
 
 Formato exacto:
-{{"clasificacion":"resuelta|no_resuelta|escalada|error_tecnico|abandonada","score":8,"template_errors":false,"name_errors":false,"issues":["issue 1"],"resumen":"Resumen en 1-2 frases.","recomendaciones":["Recomendación 1"]}}
+{{"clasificacion":"resuelta|no_resuelta|escalada|error_tecnico|abandonada","score":8,"template_errors":false,"name_errors":false,"issues":["issue 1"],"resumen":"Resumen en 1-2 frases.","recomendaciones":[{{"texto":"Recomendación 1","prioridad":"alta|media|baja"}}]}}
+
+Prioridades: alta=impacta directamente el objetivo o genera mala experiencia, media=mejora la calidad pero no es crítico, baja=optimización opcional.
 
 Criterios base: resuelta=objetivo cumplido, no_resuelta=no se logró, escalada=transferido a humano, error_tecnico=falla del sistema, abandonada=usuario colgó. Score 0-10. template_errors=true si hay {{{{variable}}}} sin reemplazar. name_errors=true si hay problemas con nombres.
 
@@ -143,27 +145,34 @@ def transcribe_with_scribe(el_key, audio_bytes):
     if not audio_bytes:
         return None
     try:
-        import urllib.request
-        boundary = "----FormBoundary7MA4YWxkTrZu0gW"
-        body_parts = []
-        body_parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"model_id\"\r\n\r\nscribe_v2".encode())
-        body_parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"diarize\"\r\n\r\ntrue".encode())
-        body_parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"detect_speaker_roles\"\r\n\r\ntrue".encode())
-        body_parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"timestamps_granularity\"\r\n\r\nword".encode())
-        body_parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"tag_audio_events\"\r\n\r\ntrue".encode())
-        body_parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.mp3\"\r\nContent-Type: audio/mpeg\r\n\r\n".encode() + audio_bytes)
-        body_parts.append(f"--{boundary}--".encode())
-        body = b"\r\n".join(body_parts)
+        import urllib.request, uuid
+        boundary = uuid.uuid4().hex
+        CRLF = b"\r\n"
+
+        def field(name, value):
+            return (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}").encode() + CRLF
+
+        body = b""
+        body += field("model_id", "scribe_v2")
+        body += field("diarize", "true")
+        body += field("detect_speaker_roles", "true")
+        body += field("timestamps_granularity", "word")
+        body += field("tag_audio_events", "true")
+        body += (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.mp3\"\r\nContent-Type: audio/mpeg\r\n\r\n").encode()
+        body += audio_bytes + CRLF
+        body += f"--{boundary}--\r\n".encode()
+
         req = urllib.request.Request(
             "https://api.elevenlabs.io/v1/speech-to-text",
             data=body,
             headers={
                 "xi-api-key": el_key,
-                "Content-Type": f"multipart/form-data; boundary={boundary}"
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "Accept": "application/json"
             },
             method="POST"
         )
-        with urllib.request.urlopen(req, timeout=60) as r:
+        with urllib.request.urlopen(req, timeout=90) as r:
             return json.loads(r.read())
     except Exception as e:
         return {"error": str(e)}
@@ -453,7 +462,34 @@ with tab1:
             else:
                 st.session_state.selected_ids.discard(cid)
         with col_info:
-            st.markdown(f"`{cid}` &nbsp; {agent_tag}🕐 {dur} &nbsp; 📅 {dt} &nbsp; 💬 {msgs} msgs", unsafe_allow_html=True)
+            # Pre-audit visual indicators
+            secs = conv.get("call_duration_secs") or 0
+            msg_count = conv.get("message_count") or 0
+            pre_flags = []
+            if msg_count == 0:
+                pre_flags.append("⚠️ sin mensajes")
+            elif msg_count <= 2:
+                pre_flags.append("💬 muy corta")
+            if secs > 0 and secs < 20:
+                pre_flags.append("⏱️ <20s")
+            elif secs > 300:
+                pre_flags.append("⏱️ +5min")
+            flags_html = " ".join(f'<span style="font-size:10px;background:#2a2a28;padding:2px 6px;border-radius:10px;color:#9e9e9a;">{f}</span>' for f in pre_flags)
+            # If already audited, show result badge
+            audit = st.session_state.audit_results.get(cid)
+            if audit and audit.get("status") == "done":
+                sc = audit.get("score", 0)
+                cl = audit.get("clasificacion", "")
+                voice = audit.get("voice") or {}
+                ca = content_alert_emoji(sc, cl, audit)
+                aa = audio_alert_emoji(voice) if voice and not voice.get("error") else ""
+                result_badge = f'<span style="font-size:11px;font-weight:600;">{ca} {sc}/10</span> {aa}'
+            else:
+                result_badge = ""
+            st.markdown(
+                f"`{cid}` &nbsp; {agent_tag}🕐 {dur} &nbsp; 📅 {dt} &nbsp; 💬 {msgs} msgs &nbsp; {flags_html} &nbsp; {result_badge}",
+                unsafe_allow_html=True
+            )
 
     if st.session_state.has_more:
         st.info("Hay más llamadas. Usa **+ Más** en la barra lateral.")
@@ -601,9 +637,32 @@ with tab2:
             recs = r.get("recomendaciones", [])
             if recs and isinstance(recs, list):
                 st.markdown("**Recomendaciones:**")
+                # Support both old format (string) and new format (dict with prioridad)
+                PRIO_COLOR = {"alta": "#791F1F", "media": "#633806", "baja": "#27500A"}
+                PRIO_BG    = {"alta": "#FCEBEB", "media": "#FAEEDA", "baja": "#EAF3DE"}
+                PRIO_ICON  = {"alta": "🔴", "media": "🟡", "baja": "🟢"}
+                rows_html = ""
                 for rc in recs:
-                    if isinstance(rc, str):
-                        st.markdown(f'<div class="rec-item">{rc}</div>', unsafe_allow_html=True)
+                    if isinstance(rc, dict):
+                        texto = rc.get("texto", "")
+                        prio  = rc.get("prioridad", "media").lower()
+                    else:
+                        texto = str(rc)
+                        prio  = "media"
+                    color = PRIO_COLOR.get(prio, "#633806")
+                    bg    = PRIO_BG.get(prio, "#FAEEDA")
+                    icon  = PRIO_ICON.get(prio, "🟡")
+                    rows_html += f'''<tr>
+                        <td style="padding:6px 10px;font-size:11px;font-weight:700;background:{bg};color:{color};border-radius:4px;white-space:nowrap;">{icon} {prio.upper()}</td>
+                        <td style="padding:6px 10px;font-size:12px;color:var(--text-color,#1a1a18);">{texto}</td>
+                    </tr>'''
+                st.markdown(f'''<table style="width:100%;border-collapse:separate;border-spacing:0 4px;">
+                    <thead><tr>
+                        <th style="font-size:10px;color:#9e9e9a;text-align:left;padding:0 10px;width:80px;">PRIORIDAD</th>
+                        <th style="font-size:10px;color:#9e9e9a;text-align:left;padding:0 10px;">RECOMENDACIÓN</th>
+                    </tr></thead>
+                    <tbody>{rows_html}</tbody>
+                </table>''', unsafe_allow_html=True)
 
             # 🎵 Análisis de voz con Scribe
             if has_voice:
@@ -655,7 +714,10 @@ with tab2:
             "error_nombre":"sí" if r.get("name_errors") else "no",
             "resumen":r.get("resumen",""),
             "issues":" | ".join(str(i) for i in r.get("issues",[]) if isinstance(i,str)),
-            "recomendaciones":" | ".join(str(i) for i in r.get("recomendaciones",[]) if isinstance(i,str)),
+            "recomendaciones":" | ".join(
+                (rc.get("texto","") + " [" + rc.get("prioridad","") + "]") if isinstance(rc, dict) else str(rc)
+                for rc in r.get("recomendaciones",[])
+            ),
             "voz_generativa": voice.get("generative_voice_score","") if has_voice else "",
             "flujo_conversacional": voice.get("conversational_flow_score","") if has_voice else "",
             "interrupciones": voice.get("interruption_score","") if has_voice else "",
