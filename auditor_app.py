@@ -129,6 +129,34 @@ def fetch_transcript(el_key, conv_id):
     data = api_req(f"https://api.elevenlabs.io/v1/convai/conversations/{conv_id}", {"xi-api-key": el_key})
     return data.get("transcript", [])
 
+def fetch_conversation_full(el_key, conv_id):
+    """Fetch full conversation data including transcript with timestamps."""
+    return api_req(f"https://api.elevenlabs.io/v1/convai/conversations/{conv_id}", {"xi-api-key": el_key})
+
+def calculate_latency(transcript):
+    """Calculate agent response latency from transcript timestamps.
+    Returns: avg_latency_ms, max_latency_ms, latency_list"""
+    latencies = []
+    user_end = None
+    for turn in transcript:
+        role = turn.get("role","")
+        # ElevenLabs provides time_in_call_secs per message
+        t = turn.get("time_in_call_secs")
+        if t is None:
+            continue
+        if role == "user":
+            user_end = t
+        elif role == "agent" and user_end is not None:
+            delta = t - user_end
+            if 0 < delta < 30:  # ignore implausible values
+                latencies.append(round(delta, 2))
+            user_end = None
+    if not latencies:
+        return None, None, []
+    avg = round(sum(latencies)/len(latencies), 2)
+    mx  = round(max(latencies), 2)
+    return avg, mx, latencies
+
 def fetch_audio_bytes(el_key, conv_id):
     """Fetch raw audio bytes from ElevenLabs."""
     try:
@@ -298,7 +326,7 @@ def to_csv(rows):
     buf = io.StringIO(); buf.write("\ufeff")
     fields = ["id","agente","fecha","duracion","clasificacion","score",
               "error_template","error_nombre","resumen","issues","recomendaciones",
-              "voz_generativa","flujo_conversacional","interrupciones","ruido_fondo",
+              "latencia_avg_s","latencia_max_s","voz_generativa","flujo_conversacional","interrupciones","ruido_fondo",
               "ruido_confundido_voz","terminacion_prematura","qa_voz","sentimiento"]
     w = csv.DictWriter(buf, fieldnames=fields)
     w.writeheader()
@@ -522,11 +550,17 @@ with tab1:
             prog.progress(i/len(ids), text=f"Evaluando {i+1}/{len(ids)}: `{cid[:35]}...`")
             try:
                 # 1. Transcripción básica
+                # Fetch full conversation data
                 tx = fetch_transcript(el_key, cid)
                 st.session_state.transcripts[cid] = tx
 
+                # Calculate latency from timestamps
+                avg_lat, max_lat, lat_list = calculate_latency(tx)
+
                 # 2. Auditoría de contenido
                 r = audit_claude(ant_key, tx, agent_ctx)
+                r["latency_avg_s"] = avg_lat
+                r["latency_max_s"] = max_lat
                 r["agent_id"] = next((c for c in convs if c["conversation_id"]==cid), {}).get("agent_id","")
 
                 # 3. Análisis de voz con Scribe si activado
@@ -586,6 +620,32 @@ with tab2:
     metrics_html += "</div>"
     st.markdown(metrics_html, unsafe_allow_html=True)
 
+    # ── Tabla agregada ──────────────────────────────────────────
+    if not st.session_state.get("is_auditing", False) and len(res) > 1:
+        with st.expander("📋 Tabla resumen de todas las llamadas", expanded=False):
+            import pandas as pd
+            PILL_SHORT = {"resuelta":"✅","no_resuelta":"❌","escalada":"↗","error_tecnico":"⚠️","abandonada":"📵"}
+            rows = []
+            for cid2, r2 in res.items():
+                conv2 = next((c for c in convs if c["conversation_id"]==cid2), {})
+                voice2 = r2.get("voice") or {}
+                has_v2 = bool(voice2 and not voice2.get("error"))
+                rows.append({
+                    "Llamada": cid2[:20]+"...",
+                    "Fecha": fmt_dt(conv2.get("start_time_unix_secs")),
+                    "Duración": fmt_dur(conv2.get("call_duration_secs")),
+                    "Estado": PILL_SHORT.get(r2.get("clasificacion",""),"?") + " " + PILL.get(r2.get("clasificacion",""),""),
+                    "Score": r2.get("score","—"),
+                    "Latencia avg": f"{r2.get('latency_avg_s','—')}s" if r2.get('latency_avg_s') else "—",
+                    "Sentimiento": (r2.get("sentimiento",{}) or {}).get("estado","—"),
+                    "Voz": voice2.get("generative_voice_score","—") if has_v2 else "—",
+                    "Flujo": voice2.get("conversational_flow_score","—") if has_v2 else "—",
+                    "Ruido": voice2.get("background_noise_level","—") if has_v2 else "—",
+                    "Template ⚠": "sí" if r2.get("template_errors") else "no",
+                })
+            df = pd.DataFrame(rows)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
     FL = {"todas":"Todas","resuelta":"✅ Resueltas","no_resuelta":"❌ No resueltas",
           "escalada":"↗ Escaladas","error_tecnico":"⚠️ Error técnico","abandonada":"📵 Abandonadas"}
     ca, cb = st.columns(2)
@@ -625,8 +685,12 @@ with tab2:
         title = f"{content_alert} Score {score}/10 — {PILL.get(clf,clf)}  •  {cid[:28]}  •  {dur}{audio_section}"
         with st.expander(title.strip()):
             st.write(r.get("resumen",""))
+            lat_avg = r.get("latency_avg_s")
+            lat_badge = f"&nbsp; ⚡ {lat_avg}s latencia" if lat_avg is not None else ""
+            lat_color = "#791F1F" if isinstance(lat_avg,float) and lat_avg > 3 else "#633806" if isinstance(lat_avg,float) and lat_avg > 1.5 else "#27500A"
+            lat_html = f'<span style="font-size:11px;font-weight:600;color:{lat_color};">{lat_badge}</span>' if lat_avg else ""
             st.markdown(f"""<div><span class="pill pill-{clf}">{PILL.get(clf,clf)}</span> &nbsp;
-<span class="{score_cls(score)}">{score}/10</span> &nbsp; {warn} &nbsp; 🕐 {dur} &nbsp; 📅 {dt}</div>
+<span class="{score_cls(score)}">{score}/10</span> &nbsp; {warn} &nbsp; 🕐 {dur} &nbsp; 📅 {dt} {lat_html}</div>
 """, unsafe_allow_html=True)
 
             # 🎵 Audio player
@@ -726,6 +790,8 @@ with tab2:
             "error_nombre":"sí" if r.get("name_errors") else "no",
             "resumen":r.get("resumen",""),
             "issues":" | ".join(str(i) for i in r.get("issues",[]) if isinstance(i,str)),
+            "latencia_avg_s": r.get("latency_avg_s",""),
+            "latencia_max_s": r.get("latency_max_s",""),
             "recomendaciones":" | ".join(
                 (rc.get("texto","") + " [" + rc.get("prioridad","") + "]") if isinstance(rc, dict) else str(rc)
                 for rc in r.get("recomendaciones",[])
