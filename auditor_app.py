@@ -26,7 +26,7 @@ st.markdown("""
   .score-mid  { color: #633806; font-weight: 700; }
   .score-low  { color: #791F1F; font-weight: 700; }
   .issue-tag  { display: inline-block; background: #f5f5f3; border: 1px solid #d3d1c7; color: #6b6b67; font-size: 11px; padding: 2px 8px; border-radius: 20px; margin: 2px; }
-  .rec-item   { font-size: 13px; color: #6b6b67; padding: 4px 0 4px 12px; border-left: 2px solid #EF9F27; margin-bottom: 4px; }
+  .rec-item   { font-size: 13px; padding: 4px 0 4px 12px; border-left: 2px solid #EF9F27; margin-bottom: 4px; }
   .resumo { font-size: 14px; line-height: 1.6; margin-bottom: 12px; }
   h1 { font-size: 24px !important; }
   .context-box { background: #FAEEDA; border-left: 3px solid #EF9F27; border-radius: 6px; padding: 10px 14px; font-size: 12px; color: #633806; margin-bottom: 8px; }
@@ -645,6 +645,7 @@ with tab2:
             if recs and isinstance(recs, list):
                 st.markdown("**Recomendaciones:**")
                 PRIO_ICON = {"alta": "🔴", "media": "🟡", "baja": "🟢"}
+                PRIO_LABEL = {"alta": "ALTA", "media": "MEDIA", "baja": "BAJA"}
                 for rc in recs:
                     if isinstance(rc, dict):
                         texto = rc.get("texto", "")
@@ -653,11 +654,8 @@ with tab2:
                         texto = str(rc)
                         prio  = "media"
                     icon = PRIO_ICON.get(prio, "🟡")
-                    col_p, col_t = st.columns([1, 6])
-                    with col_p:
-                        st.markdown(f"{icon} **{prio.upper()}**")
-                    with col_t:
-                        st.write(texto)
+                    label = PRIO_LABEL.get(prio, "MEDIA")
+                    st.markdown(f"{icon} **{label}** — {texto}")
 
             # 🎵 Análisis de voz con Scribe
             if has_voice:
