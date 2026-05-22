@@ -470,11 +470,11 @@ with tab1:
             if msg_count == 0:
                 pre_flags.append(("⚠️", "sin mensajes", "#5c3a00", "#FAEEDA"))
             elif msg_count <= 2:
-                pre_flags.append(("💬", "muy corta", "#4a4a48", "#2a2a28"))
+                pre_flags.append(("💬", "muy corta", "#5c3a00", "#FAEEDA"))
             if secs > 0 and secs < 20:
-                pre_flags.append(("⏱️", "<20s", "#4a4a48", "#2a2a28"))
+                pre_flags.append(("⏱️", "<20s", "#5c3a00", "#FAEEDA"))
             elif secs > 300:
-                pre_flags.append(("⏱️", "+5min", "#4a4a48", "#2a2a28"))
+                pre_flags.append(("⏱️", "+5min", "#5c3a00", "#FAEEDA"))
 
             audit = st.session_state.audit_results.get(cid)
             if audit and audit.get("status") == "done":
