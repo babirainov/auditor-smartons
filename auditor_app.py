@@ -3,6 +3,7 @@ import json, csv, time, io, base64
 from datetime import datetime
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError
+import urllib.parse
 
 st.set_page_config(page_title="Auditor de Smartons", page_icon="🎙️", layout="wide")
 
@@ -39,6 +40,7 @@ st.markdown("""
   .vm-mid  { color: #633806 !important; }
   .vm-low  { color: #791F1F !important; }
   .audio-badge { display: inline-block; font-size: 10px; font-weight: 600; padding: 2px 8px; border-radius: 20px; background: #e6f0ff; color: #2a3d8f; margin-left: 6px; }
+  .stt-event { font-size: 11px; color: #9e9e9a; font-style: italic; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -51,19 +53,20 @@ Criterios base: resuelta=objetivo cumplido, no_resuelta=no se logró, escalada=t
 
 {context_block}"""
 
-AUDIO_AUDIT_SYSTEM = """Eres un auditor experto de calidad de voz para agentes de IA en call centers LATAM. Analiza el audio de la llamada y devuelve SOLO JSON válido, sin markdown, sin texto extra.
+VOICE_AUDIT_SYSTEM = """Eres un auditor experto de calidad de voz para agentes de IA en call centers LATAM. Recibirás una transcripción enriquecida con timestamps, diarización de speakers y eventos de audio no verbales (ruido, silencio, etc.) generada por el modelo Scribe v2 de ElevenLabs.
 
-Evalúa estas métricas de voz:
-1. generative_voice_score (1-10): Penaliza artefactos de voz artificial, aceleraciones robóticas, cambios bruscos de velocidad, o slips al español castillano/Spain Spanish en lugar de español LATAM.
-2. conversational_flow_score (1-10): Evalúa si la latencia o delays en el procesamiento afectaron la naturalidad de la conversación.
-3. interruption_score (1-10): Penaliza al agente por cortar al usuario en medio de una frase. Perdona interrupciones causadas por ruido de fondo.
-4. background_noise_level: "limpio", "leve", "moderado" o "alto"
-5. noise_confused_with_voice (boolean): true si el agente respondió a ruido de fondo confundiéndolo con la voz del usuario.
-6. premature_termination (boolean): true si el agente desconectó antes de que el usuario terminara su intención.
-7. voice_qa_reasoning: String de 2-3 frases justificando los scores de voz.
+Analiza esta transcripción enriquecida y devuelve SOLO JSON válido, sin markdown, sin texto extra.
 
 Formato exacto:
-{{"generative_voice_score":8,"conversational_flow_score":7,"interruption_score":9,"background_noise_level":"limpio","noise_confused_with_voice":false,"premature_termination":false,"voice_qa_reasoning":"El agente mantuvo una voz natural durante toda la llamada..."}}"""
+{{"generative_voice_score":8,"conversational_flow_score":7,"interruption_score":9,"background_noise_level":"limpio|leve|moderado|alto","noise_confused_with_voice":false,"premature_termination":false,"voice_qa_reasoning":"2-3 frases justificando los scores."}}
+
+Criterios:
+- generative_voice_score (1-10): Penaliza artefactos artificiales, velocidad robótica, slips al español castillano.
+- conversational_flow_score (1-10): Evalúa si hubo latencias o delays que rompieron la naturalidad. Analiza los gaps de tiempo entre speakers.
+- interruption_score (1-10): Penaliza al agente por cortar al usuario. Perdona interrupciones por ruido de fondo. Analiza solapamientos de timestamps.
+- background_noise_level: basado en eventos de audio detectados (ruido, música, etc.)
+- noise_confused_with_voice: true si el agente respondió a ruido de fondo confundiéndolo con voz del usuario.
+- premature_termination: true si el agente terminó antes de que el usuario completara su intención."""
 
 def build_system_prompt(agent_context):
     if agent_context and agent_context.strip():
@@ -93,11 +96,10 @@ def api_req(url, headers, body=None):
         raise Exception(f"HTTP {e.code}: {err.get('detail') or err.get('error', {}).get('message', '')}")
 
 def api_req_raw(url, headers):
-    """Fetch raw bytes (for audio)."""
     req = Request(url, headers=headers)
     try:
         with urlopen(req, timeout=60) as r:
-            return r.read()
+            return r.read(), dict(r.headers)
     except HTTPError as e:
         raise Exception(f"HTTP {e.code} fetching audio")
 
@@ -123,16 +125,46 @@ def fetch_transcript(el_key, conv_id):
     data = api_req(f"https://api.elevenlabs.io/v1/convai/conversations/{conv_id}", {"xi-api-key": el_key})
     return data.get("transcript", [])
 
-def fetch_audio(el_key, conv_id):
-    """Fetch conversation audio as base64 MP3."""
+def fetch_audio_bytes(el_key, conv_id):
+    """Fetch raw audio bytes from ElevenLabs."""
     try:
-        raw = api_req_raw(
+        raw, headers = api_req_raw(
             f"https://api.elevenlabs.io/v1/convai/conversations/{conv_id}/audio",
             {"xi-api-key": el_key}
         )
-        return base64.standard_b64encode(raw).decode("utf-8")
+        return raw
     except:
         return None
+
+def transcribe_with_scribe(el_key, audio_bytes):
+    """Send audio to ElevenLabs Scribe v2 for detailed transcription with diarization."""
+    if not audio_bytes:
+        return None
+    try:
+        import urllib.request
+        boundary = "----FormBoundary7MA4YWxkTrZu0gW"
+        body_parts = []
+        body_parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"model_id\"\r\n\r\nscribe_v2".encode())
+        body_parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"diarize\"\r\n\r\ntrue".encode())
+        body_parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"detect_speaker_roles\"\r\n\r\ntrue".encode())
+        body_parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"timestamps_granularity\"\r\n\r\nword".encode())
+        body_parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"tag_audio_events\"\r\n\r\ntrue".encode())
+        body_parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.mp3\"\r\nContent-Type: audio/mpeg\r\n\r\n".encode() + audio_bytes)
+        body_parts.append(f"--{boundary}--".encode())
+        body = b"\r\n".join(body_parts)
+        req = urllib.request.Request(
+            "https://api.elevenlabs.io/v1/speech-to-text",
+            data=body,
+            headers={
+                "xi-api-key": el_key,
+                "Content-Type": f"multipart/form-data; boundary={boundary}"
+            },
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.loads(r.read())
+    except Exception as e:
+        return {"error": str(e)}
 
 def audit_claude(ant_key, transcript, agent_context=""):
     if not transcript:
@@ -147,20 +179,54 @@ def audit_claude(ant_key, transcript, agent_context=""):
     text = "".join(b["text"] for b in data.get("content",[]) if b["type"]=="text")
     return json.loads(text.replace("```json","").replace("```","").strip())
 
-def audit_audio_claude(ant_key, audio_b64):
-    """Send audio to Claude for voice quality analysis."""
-    if not audio_b64:
+def audit_voice_claude(ant_key, scribe_result):
+    """Send Scribe enriched transcription to Claude for voice quality analysis."""
+    if not scribe_result or scribe_result.get("error"):
         return None
     try:
+        # Build enriched transcript with timestamps and events
+        words = scribe_result.get("words", [])
+        enriched_lines = []
+        current_speaker = None
+        current_line = []
+        current_start = None
+
+        for w in words:
+            wtype = w.get("type", "word")
+            speaker = w.get("speaker_id", "unknown")
+            text = w.get("text", "")
+            start = w.get("start", 0)
+            end = w.get("end", 0)
+
+            if wtype == "audio_event":
+                if current_line:
+                    enriched_lines.append(f"[{current_speaker or 'Speaker'} @{current_start:.1f}s]: {' '.join(current_line)}")
+                    current_line = []
+                enriched_lines.append(f"[AUDIO_EVENT @{start:.1f}s]: {text}")
+                current_speaker = None
+                current_start = None
+            else:
+                if speaker != current_speaker:
+                    if current_line:
+                        enriched_lines.append(f"[{current_speaker or 'Speaker'} @{current_start:.1f}s]: {' '.join(current_line)}")
+                        current_line = []
+                    current_speaker = speaker
+                    current_start = start
+                current_line.append(text)
+
+        if current_line:
+            enriched_lines.append(f"[{current_speaker or 'Speaker'} @{current_start:.1f}s]: {' '.join(current_line)}")
+
+        enriched_tx = "\n".join(enriched_lines)
+
         data = api_req("https://api.anthropic.com/v1/messages",
             {"Content-Type":"application/json","x-api-key":ant_key,"anthropic-version":"2023-06-01"},
-            {"model":"claude-sonnet-4-5","max_tokens":800,"system":AUDIO_AUDIT_SYSTEM,
-             "messages":[{"role":"user","content":[
-                 {"type":"text","text":"Analiza la calidad de voz de esta llamada:"},
-                 {"type":"document","source":{"type":"base64","media_type":"audio/mpeg","data":audio_b64}}
-             ]}]})
+            {"model":"claude-sonnet-4-5","max_tokens":800,"system":VOICE_AUDIT_SYSTEM,
+             "messages":[{"role":"user","content":f"Analiza la calidad de voz de esta llamada:\n\n{enriched_tx}"}]})
         text = "".join(b["text"] for b in data.get("content",[]) if b["type"]=="text")
-        return json.loads(text.replace("```json","").replace("```","").strip())
+        result = json.loads(text.replace("```json","").replace("```","").strip())
+        result["enriched_transcript"] = enriched_lines
+        return result
     except Exception as e:
         return {"error": str(e)}
 
@@ -182,7 +248,8 @@ def to_csv(rows):
 # ── Session state ─────────────────────────────────────────────
 for k,v in {"agents":[],"conversations":[],"selected_ids":set(),"audit_results":{},
             "transcripts":{},"loaded":False,"agent_id":"","agent_name":"Todos",
-            "has_more":False,"cursor":None,"agent_context":{},"analyze_audio":True}.items():
+            "has_more":False,"cursor":None,"agent_context":{},"analyze_audio":True,
+            "audio_cache":{}}.items():
     if k not in st.session_state: st.session_state[k] = v
 
 PILL = {"resuelta":"resuelta","no_resuelta":"no resuelta","escalada":"escalada",
@@ -205,12 +272,11 @@ with st.sidebar:
     st.divider()
     page_size = st.slider("Llamadas por carga", 10, 100, 30, 10)
 
-    # Toggle análisis de audio
-    analyze_audio = st.toggle("🎵 Analizar audio (voz)", value=st.session_state.analyze_audio,
-                               help="Analiza calidad de voz, ruido de fondo e interrupciones. Tarda un poco más.")
+    analyze_audio = st.toggle("🎵 Analizar audio (Scribe v2)", value=st.session_state.analyze_audio,
+                               help="Usa ElevenLabs Scribe v2 para analizar calidad de voz, ruido, interrupciones y flujo. Tarda un poco más.")
     st.session_state.analyze_audio = analyze_audio
     if analyze_audio:
-        st.caption("Se evaluará: voz generativa, flujo, interrupciones, ruido de fondo.")
+        st.caption("Diarización + timestamps + eventos de audio → Claude evalúa calidad de voz.")
 
     c1, c2 = st.columns(2)
     with c1:
@@ -231,6 +297,7 @@ with st.sidebar:
                     st.session_state.has_more = has
                     st.session_state.selected_ids = set()
                     st.session_state.audit_results = {}
+                    st.session_state.audio_cache = {}
                     st.session_state.loaded = True
                     st.success(f"✓ {len(convs)} llamadas cargadas")
                 except Exception as e:
@@ -267,7 +334,7 @@ with st.sidebar:
         if sel:
             st.divider()
             st.markdown("**🎯 Prompt del agente:**")
-            st.markdown("<div style='font-size:11px;color:#9e9e9a;margin-bottom:6px;'>Cargado automáticamente desde ElevenLabs. Puedes editarlo para ajustar el criterio de evaluación.</div>", unsafe_allow_html=True)
+            st.markdown("<div style='font-size:11px;color:#9e9e9a;margin-bottom:6px;'>Cargado automáticamente desde ElevenLabs.</div>", unsafe_allow_html=True)
             current_ctx = st.session_state.agent_context.get(sel, "")
             new_ctx = st.text_area("Prompt", value=current_ctx,
                 placeholder="Se cargará automáticamente al seleccionar el agente.",
@@ -285,7 +352,7 @@ with st.sidebar:
                         st.warning("No se encontró prompt para este agente.")
 
     st.divider()
-    st.markdown("**Lo que se evalúa:**\n- 🤖 Clasificación\n- ⭐ Score 0–10\n- `{{` Errores de template `}}`\n- 👤 Errores de nombre\n- 🔍 Issues y recomendaciones\n- 🎵 Voz generativa\n- 🌊 Flujo conversacional\n- 🔇 Ruido de fondo\n- ✂️ Interrupciones")
+    st.markdown("**Lo que se evalúa:**\n- 🤖 Clasificación\n- ⭐ Score 0–10\n- `{{` Errores de template\n- 👤 Errores de nombre\n- 🔍 Issues y recomendaciones\n- 🎵 Voz generativa (Scribe)\n- 🌊 Flujo conversacional\n- 🔇 Ruido de fondo\n- ✂️ Interrupciones")
 
 # ── Main ──────────────────────────────────────────────────────
 st.title("Auditor de Smartons")
@@ -350,7 +417,7 @@ with tab1:
                        disabled=n==0, type="primary", use_container_width=True)
     with cb:
         if n > 0:
-            audio_label = " + audio 🎵" if st.session_state.analyze_audio else ""
+            audio_label = " + análisis de voz 🎵" if st.session_state.analyze_audio else ""
             st.markdown(f"*{n} llamadas seleccionadas{audio_label}*")
 
     if go and n > 0:
@@ -362,18 +429,29 @@ with tab1:
         for i, cid in enumerate(ids):
             prog.progress(i/len(ids), text=f"Evaluando {i+1}/{len(ids)}: `{cid[:35]}...`")
             try:
+                # 1. Transcripción básica
                 tx = fetch_transcript(el_key, cid)
                 st.session_state.transcripts[cid] = tx
+
+                # 2. Auditoría de contenido
                 r = audit_claude(ant_key, tx, agent_ctx)
                 r["agent_id"] = next((c for c in convs if c["conversation_id"]==cid), {}).get("agent_id","")
 
-                # Análisis de audio si está activado
+                # 3. Análisis de voz con Scribe si activado
                 if st.session_state.analyze_audio:
-                    prog.progress(i/len(ids), text=f"Analizando audio {i+1}/{len(ids)}: `{cid[:30]}...`")
-                    audio_b64 = fetch_audio(el_key, cid)
-                    if audio_b64:
-                        voice_result = audit_audio_claude(ant_key, audio_b64)
-                        r["voice"] = voice_result
+                    prog.progress(i/len(ids), text=f"Descargando audio {i+1}/{len(ids)}: `{cid[:30]}...`")
+                    audio_bytes = fetch_audio_bytes(el_key, cid)
+                    if audio_bytes:
+                        # Cache audio for player
+                        st.session_state.audio_cache[cid] = base64.b64encode(audio_bytes).decode()
+                        prog.progress(i/len(ids), text=f"Transcribiendo con Scribe {i+1}/{len(ids)}...")
+                        scribe = transcribe_with_scribe(el_key, audio_bytes)
+                        if scribe and not scribe.get("error"):
+                            prog.progress(i/len(ids), text=f"Analizando voz {i+1}/{len(ids)}...")
+                            voice = audit_voice_claude(ant_key, scribe)
+                            r["voice"] = voice
+                        else:
+                            r["voice"] = scribe  # will show error
                     else:
                         r["voice"] = None
 
@@ -398,9 +476,8 @@ with tab2:
     issues_count = sum(1 for r in done if r.get("issues"))
     tpl          = sum(1 for r in done if r.get("template_errors"))
 
-    # Métricas de voz si existen
     voice_results = [r["voice"] for r in done if r.get("voice") and not r["voice"].get("error")]
-    avg_voz = sum(v.get("generative_voice_score",0) for v in voice_results)/len(voice_results) if voice_results else None
+    avg_voz   = sum(v.get("generative_voice_score",0) for v in voice_results)/len(voice_results) if voice_results else None
     avg_flujo = sum(v.get("conversational_flow_score",0) for v in voice_results)/len(voice_results) if voice_results else None
     noise_issues = sum(1 for v in voice_results if v.get("noise_confused_with_voice")) if voice_results else 0
 
@@ -437,12 +514,13 @@ with tab2:
         dt    = fmt_dt(conv.get("start_time_unix_secs"))
         score = r.get("score",0)
         voice = r.get("voice") or {}
-        has_voice = voice and not voice.get("error")
+        has_voice = bool(voice and not voice.get("error"))
+        audio_b64 = st.session_state.audio_cache.get(cid)
 
         warn = "".join([
             '<span class="pill pill-warn">⚠ template</span> ' if r.get("template_errors") else "",
             '<span class="pill pill-warn">⚠ nombre</span>'    if r.get("name_errors")     else "",
-            '<span class="audio-badge">🎵 audio</span>'       if has_voice else ""
+            '<span class="audio-badge">🎵 Scribe</span>'      if has_voice else ""
         ])
 
         with st.expander(f"Score {score}/10 — {PILL.get(clf,clf)}  •  {cid[:38]}  •  {dur}"):
@@ -450,6 +528,12 @@ with tab2:
             st.markdown(f"""<div><span class="pill pill-{clf}">{PILL.get(clf,clf)}</span> &nbsp;
 <span class="{score_cls(score)}">{score}/10</span> &nbsp; {warn} &nbsp; 🕐 {dur} &nbsp; 📅 {dt}</div>
 """, unsafe_allow_html=True)
+
+            # 🎵 Audio player
+            if audio_b64:
+                st.markdown("**🎵 Audio de la llamada:**")
+                audio_bytes = base64.b64decode(audio_b64)
+                st.audio(audio_bytes, format="audio/mp3")
 
             issues = r.get("issues", [])
             if issues and isinstance(issues, list):
@@ -464,7 +548,7 @@ with tab2:
                     if isinstance(rc, str):
                         st.markdown(f'<div class="rec-item">{rc}</div>', unsafe_allow_html=True)
 
-            # Sección de análisis de voz
+            # 🎵 Análisis de voz con Scribe
             if has_voice:
                 vg  = voice.get("generative_voice_score", "—")
                 vf  = voice.get("conversational_flow_score", "—")
@@ -474,10 +558,10 @@ with tab2:
                 vpt = "✅ No" if not voice.get("premature_termination") else "⚠️ Sí"
                 vqa = voice.get("voice_qa_reasoning", "")
 
-                def vc(v): return f"vm-high" if isinstance(v,int) and v>=7 else "vm-mid" if isinstance(v,int) and v>=5 else "vm-low"
+                def vc(v): return "vm-high" if isinstance(v,int) and v>=7 else "vm-mid" if isinstance(v,int) and v>=5 else "vm-low"
 
                 st.markdown(f"""<div class="voice-section">
-  <div class="voice-section-title">🎵 Análisis de voz</div>
+  <div class="voice-section-title">🎵 Análisis de voz (Scribe v2)</div>
   <div class="voice-metric"><span class="vm-label">Voz generativa</span><span class="vm-val {vc(vg)}">{vg}/10</span></div>
   <div class="voice-metric"><span class="vm-label">Flujo conversacional</span><span class="vm-val {vc(vf)}">{vf}/10</span></div>
   <div class="voice-metric"><span class="vm-label">Interrupciones</span><span class="vm-val {vc(vi)}">{vi}/10</span></div>
@@ -487,6 +571,20 @@ with tab2:
   {"<div style='font-size:12px;color:#6b6b67;margin-top:8px;'>" + vqa + "</div>" if vqa else ""}
 </div>""", unsafe_allow_html=True)
 
+                # Transcripción enriquecida con timestamps
+                enriched = voice.get("enriched_transcript", [])
+                if enriched:
+                    with st.expander("🕐 Transcripción con timestamps (Scribe)"):
+                        for line in enriched:
+                            if "AUDIO_EVENT" in line:
+                                st.markdown(f"<span class='stt-event'>{line}</span>", unsafe_allow_html=True)
+                            else:
+                                st.markdown(line)
+
+            elif voice.get("error"):
+                st.caption(f"⚠️ No se pudo analizar el audio: {voice['error']}")
+
+            # Transcripción básica
             tx = st.session_state.transcripts.get(cid,[])
             if tx:
                 with st.expander("Ver transcripción"):
