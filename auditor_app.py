@@ -47,7 +47,7 @@ st.markdown("""
 BASE_AUDIT_SYSTEM = """Eres un auditor experto de agentes de voz para call centers LATAM. Analiza la transcripción y devuelve SOLO JSON válido, sin markdown, sin texto extra.
 
 Formato exacto:
-{{"clasificacion":"resuelta|no_resuelta|escalada|error_tecnico|abandonada","score":8,"template_errors":false,"name_errors":false,"issues":["issue 1"],"resumen":"Resumen en 1-2 frases.","recomendaciones":[{{"texto":"Recomendación 1","prioridad":"alta|media|baja"}}]}}
+{{"clasificacion":"resuelta|no_resuelta|escalada|error_tecnico|abandonada","score":8,"template_errors":false,"name_errors":false,"issues":["issue 1"],"resumen":"Resumen en 1-2 frases.","recomendaciones":[{{"texto":"Recomendación 1","prioridad":"alta|media|baja"}}],"sentimiento":{{"estado":"satisfecho|neutro|frustrado|confuso|molesto","intensidad":"leve|moderado|intenso","detalle":"1 frase explicando el tono emocional del usuario."}}}}
 
 Prioridades: alta=impacta directamente el objetivo o genera mala experiencia, media=mejora la calidad pero no es crítico, baja=optimización opcional.
 
@@ -634,6 +634,25 @@ with tab2:
                 st.markdown("**🎵 Audio de la llamada:**")
                 audio_bytes = base64.b64decode(audio_b64)
                 st.audio(audio_bytes, format="audio/mp3")
+
+            # Sentimiento
+            sent = r.get("sentimiento") or {}
+            if sent and isinstance(sent, dict):
+                SENT_EMOJI = {"satisfecho":"😊","neutro":"😐","frustrado":"😤","confuso":"😕","molesto":"😠"}
+                SENT_COLOR = {"satisfecho":"#EAF3DE","neutro":"#f5f5f3","frustrado":"#FAEEDA","confuso":"#E6F1FB","molesto":"#FCEBEB"}
+                SENT_TEXT  = {"satisfecho":"#27500A","neutro":"#444441","frustrado":"#633806","confuso":"#0C447C","molesto":"#791F1F"}
+                INT_LABEL  = {"leve":"leve","moderado":"moderado","intenso":"intenso"}
+                estado = sent.get("estado","neutro")
+                intensidad = sent.get("intensidad","leve")
+                detalle = sent.get("detalle","")
+                emoji = SENT_EMOJI.get(estado,"😐")
+                bg = SENT_COLOR.get(estado,"#f5f5f3")
+                tc = SENT_TEXT.get(estado,"#444441")
+                st.markdown(f'''<div style="background:{bg};border-radius:8px;padding:10px 14px;margin:8px 0;">
+  <span style="font-size:13px;font-weight:700;color:{tc};">{emoji} {estado.upper()}</span>
+  <span style="font-size:11px;color:{tc};margin-left:8px;opacity:0.8;">· {INT_LABEL.get(intensidad,intensidad)}</span>
+  <div style="font-size:12px;color:{tc};margin-top:4px;opacity:0.9;">{detalle}</div>
+</div>''', unsafe_allow_html=True)
 
             issues = r.get("issues", [])
             if issues and isinstance(issues, list):
