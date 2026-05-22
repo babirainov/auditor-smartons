@@ -644,11 +644,7 @@ with tab2:
             recs = r.get("recomendaciones", [])
             if recs and isinstance(recs, list):
                 st.markdown("**Recomendaciones:**")
-                # Support both old format (string) and new format (dict with prioridad)
-                PRIO_COLOR = {"alta": "#791F1F", "media": "#633806", "baja": "#27500A"}
-                PRIO_BG    = {"alta": "#FCEBEB", "media": "#FAEEDA", "baja": "#EAF3DE"}
-                PRIO_ICON  = {"alta": "🔴", "media": "🟡", "baja": "🟢"}
-                rows_html = ""
+                PRIO_ICON = {"alta": "🔴", "media": "🟡", "baja": "🟢"}
                 for rc in recs:
                     if isinstance(rc, dict):
                         texto = rc.get("texto", "")
@@ -656,20 +652,12 @@ with tab2:
                     else:
                         texto = str(rc)
                         prio  = "media"
-                    color = PRIO_COLOR.get(prio, "#633806")
-                    bg    = PRIO_BG.get(prio, "#FAEEDA")
-                    icon  = PRIO_ICON.get(prio, "🟡")
-                    rows_html += f'''<tr>
-                        <td style="padding:6px 10px;font-size:11px;font-weight:700;background:{bg};color:{color};border-radius:4px;white-space:nowrap;vertical-align:top;">{icon} {prio.upper()}</td>
-                        <td style="padding:6px 10px;font-size:12px;color:#e0e0de;vertical-align:top;">{texto}</td>
-                    </tr>'''
-                st.markdown(f'''<table style="width:100%;border-collapse:separate;border-spacing:0 4px;background:#1e1e1c;border-radius:8px;overflow:hidden;">
-                    <thead><tr style="background:#2a2a28;">
-                        <th style="font-size:10px;color:#9e9e9a;text-align:left;padding:6px 10px;width:90px;">PRIORIDAD</th>
-                        <th style="font-size:10px;color:#9e9e9a;text-align:left;padding:6px 10px;">RECOMENDACIÓN</th>
-                    </tr></thead>
-                    <tbody>{rows_html}</tbody>
-                </table>''', unsafe_allow_html=True)
+                    icon = PRIO_ICON.get(prio, "🟡")
+                    col_p, col_t = st.columns([1, 6])
+                    with col_p:
+                        st.markdown(f"{icon} **{prio.upper()}**")
+                    with col_t:
+                        st.write(texto)
 
             # 🎵 Análisis de voz con Scribe
             if has_voice:
