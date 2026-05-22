@@ -157,6 +157,14 @@ def calculate_latency(transcript):
     mx  = round(max(latencies), 2)
     return avg, mx, latencies
 
+def check_has_audio(el_key, conv_id):
+    """Check if conversation has audio available."""
+    try:
+        data = api_req(f"https://api.elevenlabs.io/v1/convai/conversations/{conv_id}", {"xi-api-key": el_key})
+        return data.get("has_audio", False)
+    except:
+        return False
+
 def fetch_audio_bytes(el_key, conv_id):
     """Fetch raw audio bytes from ElevenLabs."""
     try:
@@ -456,6 +464,21 @@ tab1, tab2 = st.tabs([f"📋 Llamadas ({len(convs)})", "📊 Resultados"])
 with tab1:
     st.markdown(f"**Agente:** {st.session_state.agent_name} &nbsp;·&nbsp; **{len(convs)} conversaciones**")
 
+    # ── Filtros ──────────────────────────────────────────────────
+    with st.expander("🔍 Filtros", expanded=False):
+        fc1, fc2 = st.columns(2)
+        with fc1:
+            status_filter = st.selectbox("Status", ["todos","done","failed"], 
+                format_func=lambda x: "Todos" if x=="todos" else x)
+        with fc2:
+            min_dur = st.slider("Duración mínima (seg)", 0, 300, 0, 10)
+    convs_filtered = [c for c in convs if
+        (status_filter == "todos" or c.get("status") == status_filter) and
+        ((c.get("call_duration_secs") or 0) >= min_dur)
+    ]
+    if len(convs_filtered) != len(convs):
+        st.caption(f"Mostrando {len(convs_filtered)} de {len(convs)} llamadas")
+
     ctx = st.session_state.agent_context.get(st.session_state.agent_id, "")
     if ctx:
         st.markdown(f'<div class="context-box">🎯 <strong>Objetivo activo:</strong> {ctx[:200]}{"..." if len(ctx)>200 else ""}</div>', unsafe_allow_html=True)
@@ -477,7 +500,7 @@ with tab1:
 
     st.divider()
 
-    for conv in convs:
+    for conv in convs_filtered:
         cid = conv["conversation_id"]
         agent_tag = f"🤖 `{conv.get('agent_id','')[:20]}`&nbsp;" if not st.session_state.agent_id else ""
         dur = fmt_dur(conv.get("call_duration_secs"))
@@ -565,8 +588,9 @@ with tab1:
 
                 # 3. Análisis de voz con Scribe si activado
                 if st.session_state.analyze_audio:
-                    prog.progress(i/len(ids), text=f"Descargando audio {i+1}/{len(ids)}: `{cid[:30]}...`")
-                    audio_bytes = fetch_audio_bytes(el_key, cid)
+                    prog.progress(i/len(ids), text=f"Verificando audio {i+1}/{len(ids)}: `{cid[:30]}...`")
+                    has_audio = check_has_audio(el_key, cid)
+                    audio_bytes = fetch_audio_bytes(el_key, cid) if has_audio else None
                     if audio_bytes:
                         # Cache audio for player
                         st.session_state.audio_cache[cid] = base64.b64encode(audio_bytes).decode()
@@ -619,6 +643,24 @@ with tab2:
       <div class="metric-box"><div class="label">🔇 Ruido→voz</div><div class="value">{noise_issues}</div><div class="sub">llamadas</div></div>"""
     metrics_html += "</div>"
     st.markdown(metrics_html, unsafe_allow_html=True)
+
+    # ── Reset button ────────────────────────────────────────────
+    if st.button("← Nueva evaluación", type="secondary"):
+        for key in ["conversations","selected_ids","audit_results","transcripts",
+                    "audio_cache","loaded","agent_id","agent_name","agents",
+                    "has_more","cursor","agent_context"]:
+            if key in st.session_state:
+                if isinstance(st.session_state[key], set):
+                    st.session_state[key] = set()
+                elif isinstance(st.session_state[key], dict):
+                    st.session_state[key] = {}
+                elif isinstance(st.session_state[key], list):
+                    st.session_state[key] = []
+                elif isinstance(st.session_state[key], bool):
+                    st.session_state[key] = False
+                else:
+                    st.session_state[key] = ""
+        st.rerun()
 
     # ── Tabla agregada ──────────────────────────────────────────
     if not st.session_state.get("is_auditing", False) and len(res) > 1:
@@ -687,8 +729,7 @@ with tab2:
             st.write(r.get("resumen",""))
             lat_avg = r.get("latency_avg_s")
             lat_badge = f"&nbsp; ⚡ {lat_avg}s latencia" if lat_avg is not None else ""
-            lat_color = "#791F1F" if isinstance(lat_avg,float) and lat_avg > 3 else "#633806" if isinstance(lat_avg,float) and lat_avg > 1.5 else "#27500A"
-            lat_html = f'<span style="font-size:11px;font-weight:600;color:{lat_color};">{lat_badge}</span>' if lat_avg else ""
+            lat_html = f'<span style="font-size:11px;font-weight:700;color:#ffffff;">{lat_badge}</span>' if lat_avg else ""
             st.markdown(f"""<div><span class="pill pill-{clf}">{PILL.get(clf,clf)}</span> &nbsp;
 <span class="{score_cls(score)}">{score}/10</span> &nbsp; {warn} &nbsp; 🕐 {dur} &nbsp; 📅 {dt} {lat_html}</div>
 """, unsafe_allow_html=True)
