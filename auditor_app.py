@@ -226,7 +226,7 @@ def transcribe_with_scribe(el_key, audio_bytes):
     except Exception as e:
         return {"error": str(e)}
 
-# ── NOVA FUNÇÃO: extrai métricas acústicas reais do Scribe ────────────────────
+# ── NOVA FUNÇÃO: extrai métricas acústicas reais do Scribe v2 ──────────────
 def extract_acoustic_metrics(scribe_result):
     """Extrai métricas acústicas reais do resultado do Scribe v2."""
     if not scribe_result or scribe_result.get("error"):
@@ -262,7 +262,7 @@ def extract_acoustic_metrics(scribe_result):
             return None
         return round((len(word_list) / total_time) * 60, 1)
 
-    # Pausas entre turnos
+    # Pausas entre turnos (gap entre último user e primeiro agent)
     silences = []
     prev_end = None
     prev_speaker = None
@@ -278,7 +278,7 @@ def extract_acoustic_metrics(scribe_result):
         prev_end = w.get("end", 0)
         prev_speaker = curr_speaker
 
-    # Duração média das palavras do agente (proxy de naturalidade)
+    # Duración media de palabras del agente (proxy de velocidade artificial)
     avg_agent_word_dur = round(sum(agent_durations) / len(agent_durations), 3) if agent_durations else None
 
     return {
@@ -350,12 +350,12 @@ def audit_voice_claude(ant_key, scribe_result):
         if acoustic:
             acoustic_block = f"""
 MÉTRICAS ACÚSTICAS REAIS (extraídas do áudio):
-- Velocidade de fala do agente: {acoustic.get('agent_wpm', '—')} palavras/min
-- Velocidade de fala do usuário: {acoustic.get('user_wpm', '—')} palavras/min
-- Gap médio entre turnos: {acoustic.get('avg_turn_gap_s', '—')}s
+- Velocidad de habla del agente: {acoustic.get('agent_wpm', '—')} palavras/min
+- Velocidad de habla del usuario: {acoustic.get('user_wpm', '—')} palavras/min
+- Gap promedio entre turnos: {acoustic.get('avg_turn_gap_s', '—')}s
 - Gap máximo entre turnos: {acoustic.get('max_turn_gap_s', '—')}s
-- Pausas longas (>2s): {acoustic.get('long_pauses', '—')}
-- Duração média das palavras do agente: {acoustic.get('avg_agent_word_duration_ms', '—')}ms
+- Pausas largas (>2s): {acoustic.get('long_pauses', '—')}
+- Duración media de palabras del agente: {acoustic.get('avg_agent_word_duration_ms', '—')}ms
 - Total palabras agente: {acoustic.get('total_agent_words', '—')}
 - Total palabras usuario: {acoustic.get('total_user_words', '—')}
 """
@@ -367,7 +367,7 @@ MÉTRICAS ACÚSTICAS REAIS (extraídas do áudio):
         text = "".join(b["text"] for b in data.get("content",[]) if b["type"]=="text")
         result = json.loads(text.replace("```json","").replace("```","").strip())
         result["enriched_transcript"] = enriched_lines
-        result["acoustic_metrics"] = acoustic  # salva métricas no resultado
+        result["acoustic_metrics"] = acoustic
         return result
     except Exception as e:
         return {"error": str(e)}
@@ -465,7 +465,7 @@ with st.sidebar:
                                help="Usa ElevenLabs Scribe v2 para analizar calidad de voz, ruido, interrupciones y flujo. Tarda un poco más.")
     st.session_state.analyze_audio = analyze_audio
     if analyze_audio:
-        st.caption("Diarización + timestamps + métricas acústicas → Claude evalúa calidad de voz.")
+        st.caption("Diarización + timestamps + métricas acústicas reales → Claude evalúa calidad de voz.")
 
     c1, c2 = st.columns(2)
     with c1:
@@ -541,7 +541,7 @@ with st.sidebar:
                         st.warning("No se encontró prompt para este agente.")
 
     st.divider()
-    st.markdown("**Lo que se evalúa:**\n- 🤖 Clasificación\n- ⭐ Score 0–10\n- `{{` Errores de template\n- 👤 Errores de nombre\n- 🔍 Issues y recomendaciones\n- 🎵 Voz generativa (Scribe)\n- 🌊 Flujo conversacional\n- 🔇 Ruido de fondo\n- ✂️ Interrupciones\n- 📊 Métricas acústicas reales")
+    st.markdown("**Lo que se evalúa:**\n- 🤖 Clasificación\n- ⭐ Score 0–10\n- `{{` Errores de template\n- 👤 Errores de nombre\n- 🔍 Issues y recomendaciones\n- 🎵 Voz generativa (Scribe)\n- 🌊 Flujo conversacional\n- 🔇 Ruido de fondo\n- ✂️ Interrupciones\n- 📊 WPM · gaps · pausas")
 
 # ── Main ──────────────────────────────────────────────────────
 st.title("Auditor de Smartons")
@@ -718,9 +718,9 @@ with tab2:
     noise_issues = sum(1 for v in voice_results if v.get("noise_confused_with_voice")) if voice_results else 0
 
     # Métricas acústicas agregadas
-    acoustic_results = [v.get("acoustic_metrics",{}) for v in voice_results if v.get("acoustic_metrics")]
-    avg_agent_wpm = round(sum(a["agent_wpm"] for a in acoustic_results if a.get("agent_wpm")) / max(1, sum(1 for a in acoustic_results if a.get("agent_wpm"))), 1) if acoustic_results else None
-    avg_gap = round(sum(a["avg_turn_gap_s"] for a in acoustic_results if a.get("avg_turn_gap_s")) / max(1, sum(1 for a in acoustic_results if a.get("avg_turn_gap_s"))), 2) if acoustic_results else None
+    acoustic_results = [r["voice"].get("acoustic_metrics",{}) for r in done if r.get("voice") and not r["voice"].get("error") and r["voice"].get("acoustic_metrics")]
+    avg_agent_wpm = round(sum(a["agent_wpm"] for a in acoustic_results if a.get("agent_wpm")) / len([a for a in acoustic_results if a.get("agent_wpm")]), 1) if any(a.get("agent_wpm") for a in acoustic_results) else None
+    avg_gap = round(sum(a["avg_turn_gap_s"] for a in acoustic_results if a.get("avg_turn_gap_s")) / len([a for a in acoustic_results if a.get("avg_turn_gap_s")]), 2) if any(a.get("avg_turn_gap_s") for a in acoustic_results) else None
 
     metrics_html = f"""<div class="metric-row">
       <div class="metric-box"><div class="label">Score promedio</div><div class="value">{avg:.1f}</div><div class="sub">de 10</div></div>
@@ -734,10 +734,10 @@ with tab2:
       <div class="metric-box"><div class="label">🔇 Ruido→voz</div><div class="value">{noise_issues}</div><div class="sub">llamadas</div></div>"""
     if avg_agent_wpm is not None:
         metrics_html += f"""
-      <div class="metric-box"><div class="label">🗣️ WPM agente</div><div class="value">{avg_agent_wpm}</div><div class="sub">palabras/min</div></div>"""
+      <div class="metric-box"><div class="label">📊 WPM agente</div><div class="value">{avg_agent_wpm}</div><div class="sub">palabras/min</div></div>"""
     if avg_gap is not None:
         metrics_html += f"""
-      <div class="metric-box"><div class="label">⏱️ Gap promedio</div><div class="value">{avg_gap}s</div><div class="sub">entre turnos</div></div>"""
+      <div class="metric-box"><div class="label">⏱ Gap promedio</div><div class="value">{avg_gap}s</div><div class="sub">entre turnos</div></div>"""
     metrics_html += "</div>"
     st.markdown(metrics_html, unsafe_allow_html=True)
 
@@ -780,7 +780,8 @@ with tab2:
                     "Flujo": voice2.get("conversational_flow_score","—") if has_v2 else "—",
                     "Ruido": voice2.get("background_noise_level","—") if has_v2 else "—",
                     "WPM agente": ac2.get("agent_wpm","—"),
-                    "Gap médio (s)": ac2.get("avg_turn_gap_s","—"),
+                    "Gap avg (s)": ac2.get("avg_turn_gap_s","—"),
+                    "Pausas largas": ac2.get("long_pauses","—"),
                     "Template ⚠": "sí" if r2.get("template_errors") else "no",
                 })
             df = pd.DataFrame(rows)
@@ -835,8 +836,8 @@ with tab2:
 
             if audio_b64:
                 st.markdown("**🎵 Audio de la llamada:**")
-                audio_bytes = base64.b64decode(audio_b64)
-                st.audio(audio_bytes, format="audio/mp3")
+                audio_bytes_play = base64.b64decode(audio_b64)
+                st.audio(audio_bytes_play, format="audio/mp3")
 
             sent = r.get("sentimiento") or {}
             if sent and isinstance(sent, dict):
@@ -901,30 +902,35 @@ with tab2:
   {"<div style='font-size:12px;color:#6b6b67;margin-top:8px;'>" + vqa + "</div>" if vqa else ""}
 </div>""", unsafe_allow_html=True)
 
-                # Métricas acústicas reais
+                # Métricas acústicas reales
                 if acoustic:
-                    agent_wpm_val = acoustic.get('agent_wpm','—')
-                    user_wpm_val  = acoustic.get('user_wpm','—')
-                    gap_avg_val   = acoustic.get('avg_turn_gap_s','—')
-                    gap_max_val   = acoustic.get('max_turn_gap_s','—')
-                    pauses_val    = acoustic.get('long_pauses','—')
-                    word_dur_val  = acoustic.get('avg_agent_word_duration_ms','—')
+                    agent_wpm_val = acoustic.get('agent_wpm', '—')
+                    user_wpm_val  = acoustic.get('user_wpm', '—')
+                    gap_avg_val   = acoustic.get('avg_turn_gap_s', '—')
+                    gap_max_val   = acoustic.get('max_turn_gap_s', '—')
+                    pauses_val    = acoustic.get('long_pauses', '—')
+                    word_dur_val  = acoustic.get('avg_agent_word_duration_ms', '—')
 
                     def wpm_cls(v):
-                        if not isinstance(v, (int,float)): return ""
-                        return "vm-high" if 110 <= v <= 160 else "vm-mid" if 90 <= v <= 180 else "vm-low"
+                        if not isinstance(v, (int, float)): return ""
+                        if 110 <= v <= 160: return "vm-high"
+                        if v > 180 or v < 90: return "vm-low"
+                        return "vm-mid"
+
                     def gap_cls(v):
-                        if not isinstance(v, (int,float)): return ""
-                        return "vm-high" if v < 1.5 else "vm-mid" if v < 2.5 else "vm-low"
+                        if not isinstance(v, (int, float)): return ""
+                        if v <= 1.5: return "vm-high"
+                        if v <= 2.5: return "vm-mid"
+                        return "vm-low"
 
                     st.markdown(f"""<div class="voice-section" style="margin-top:8px;background:#f0fff4;border-left-color:#27ae60;">
-  <div class="voice-section-title" style="color:#1a6b3a;">📊 Métricas acústicas reais</div>
-  <div class="voice-metric"><span class="vm-label">Velocidade fala agente</span><span class="vm-val {wpm_cls(agent_wpm_val)}">{agent_wpm_val} wpm</span></div>
-  <div class="voice-metric"><span class="vm-label">Velocidade fala usuário</span><span class="vm-val">{user_wpm_val} wpm</span></div>
-  <div class="voice-metric"><span class="vm-label">Gap médio entre turnos</span><span class="vm-val {gap_cls(gap_avg_val)}">{gap_avg_val}s</span></div>
+  <div class="voice-section-title" style="color:#1a6b3a;">📊 Métricas acústicas reales</div>
+  <div class="voice-metric"><span class="vm-label">Velocidad de habla agente</span><span class="vm-val {wpm_cls(agent_wpm_val)}">{agent_wpm_val} wpm</span></div>
+  <div class="voice-metric"><span class="vm-label">Velocidad de habla usuario</span><span class="vm-val">{user_wpm_val} wpm</span></div>
+  <div class="voice-metric"><span class="vm-label">Gap promedio entre turnos</span><span class="vm-val {gap_cls(gap_avg_val)}">{gap_avg_val}s</span></div>
   <div class="voice-metric"><span class="vm-label">Gap máximo</span><span class="vm-val {gap_cls(gap_max_val)}">{gap_max_val}s</span></div>
-  <div class="voice-metric"><span class="vm-label">Pausas longas (&gt;2s)</span><span class="vm-val {'vm-low' if isinstance(pauses_val,int) and pauses_val>2 else 'vm-high' if isinstance(pauses_val,int) else ''}">{pauses_val}</span></div>
-  <div class="voice-metric"><span class="vm-label">Duração média palavras agente</span><span class="vm-val">{word_dur_val}ms</span></div>
+  <div class="voice-metric"><span class="vm-label">Pausas largas (&gt;2s)</span><span class="vm-val {'vm-low' if isinstance(pauses_val,int) and pauses_val>2 else 'vm-high' if isinstance(pauses_val,int) else ''}">{pauses_val}</span></div>
+  <div class="voice-metric"><span class="vm-label">Duración media palabras agente</span><span class="vm-val">{word_dur_val}ms</span></div>
 </div>""", unsafe_allow_html=True)
 
                 enriched = voice.get("enriched_transcript", [])
