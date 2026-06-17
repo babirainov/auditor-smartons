@@ -190,7 +190,7 @@ def gemini_req(gemini_key, contents, system_instruction=None, max_tokens=1000):
     """
     import urllib.request
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={gemini_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}"
 
     body = {
         "contents": contents,
