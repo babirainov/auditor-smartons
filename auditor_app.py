@@ -39,11 +39,12 @@ st.markdown("""
   .vm-high { color: #27500A !important; }
   .vm-mid  { color: #633806 !important; }
   .vm-low  { color: #791F1F !important; }
-  .audio-badge { display: inline-block; font-size: 10px; font-weight: 600; padding: 2px 8px; border-radius: 20px; background: #e6f0ff; color: #2a3d8f; margin-left: 6px; }
-  .stt-event { font-size: 11px; color: #9e9e9a; font-style: italic; }
+  .audio-badge { display: inline-block; font-size: 10px; font-weight: 600; padding: 2px 8px; border-radius: 20px; background: #e8f5e9; color: #1b5e20; margin-left: 6px; }
+  .gemini-badge { display: inline-block; font-size: 10px; font-weight: 600; padding: 2px 8px; border-radius: 20px; background: #e8f0fe; color: #1a73e8; margin-left: 6px; }
 </style>
 """, unsafe_allow_html=True)
 
+# ── Prompts ───────────────────────────────────────────────────
 BASE_AUDIT_SYSTEM = """Eres un auditor experto de agentes de voz para call centers LATAM. Analiza la transcripción y devuelve SOLO JSON válido, sin markdown, sin texto extra.
 
 Formato exacto:
@@ -55,34 +56,36 @@ Criterios base: resuelta=objetivo cumplido, no_resuelta=no se logró, escalada=t
 
 {context_block}"""
 
-VOICE_AUDIT_SYSTEM = """Eres un auditor experto de calidad de voz para agentes de IA en call centers LATAM. Recibirás:
-1. Una transcripción enriquecida con timestamps y diarización (Scribe v2)
-2. Métricas acústicas reales extraídas del audio
+VOICE_AUDIT_SYSTEM = """Eres un auditor experto de calidad de voz para agentes de IA en call centers LATAM. Recibirás el archivo de audio real de la llamada.
 
-Devuelve SOLO JSON válido, sin markdown, sin texto extra.
+Escucha el audio completo y devuelve SOLO JSON válido, sin markdown, sin texto extra.
 
 Formato exacto:
-{"generative_voice_score":8,"conversational_flow_score":7,"interruption_score":9,"background_noise_level":"limpio|leve|moderado|alto","noise_confused_with_voice":false,"premature_termination":false,"user_sentiment":"satisfecho|neutro|frustrado|confuso|molesto","voice_qa_reasoning":"2-3 frases justificando los scores."}
+{"generative_voice_score":8,"conversational_flow_score":7,"interruption_score":9,"background_noise_level":"limpio|leve|moderado|alto","noise_confused_with_voice":false,"premature_termination":false,"user_sentiment":"satisfecho|neutro|frustrado|confuso|molesto","agent_wpm":145,"avg_turn_gap_s":1.2,"long_pauses":0,"voice_qa_reasoning":"2-3 frases justificando los scores basado en lo que escuchaste."}
 
-Criterios — usa las métricas acústicas como evidencia principal:
+Criterios de evaluación auditiva:
 
 - generative_voice_score (1-10):
-  Penaliza si agent_wpm > 180 (muy rápido) o < 100 (robótico/lento).
-  Penaliza si avg_agent_word_duration_ms es muy uniforme (voz sintética sin variación natural).
-  Penaliza artefactos, slips al español castillano.
+  Evalúa naturalidad, entonación, ritmo y variación prosódica.
+  Penaliza: velocidad excesiva (>180 wpm), voz robótica/monótona, artefactos, pronunciación castellana en contexto LATAM.
+  Premia: variación natural de pitch, pausas expresivas, fluidez.
 
 - conversational_flow_score (1-10):
-  Usa avg_turn_gap_s: gaps > 2s entre turnos = latencia alta, penaliza.
-  Usa max_turn_gap_s: si > 4s, penaliza fuerte.
-  Usa long_pauses: más de 2 pausas largas = penaliza.
+  Evalúa la fluidez del diálogo y los tiempos de respuesta.
+  Penaliza: silencios largos (>2s) entre turnos, respuestas demasiado rápidas sin procesar, solapamientos frecuentes.
 
 - interruption_score (1-10):
-  Analiza solapamientos en timestamps. Perdona interrupciones por ruido.
-  Penaliza si el agente corta al usuario frecuentemente.
+  Evalúa si el agente respeta los turnos del usuario.
+  Penaliza: interrupciones frecuentes por parte del agente.
+  Perdona: interrupciones causadas por ruido de fondo.
 
-- background_noise_level: basado en AUDIO_EVENTs detectados.
-- noise_confused_with_voice: true si el agente respondió a ruido.
-- premature_termination: true si el agente terminó antes que el usuario completara su intención."""
+- background_noise_level: lo que escuchas en el audio (limpio/leve/moderado/alto).
+- noise_confused_with_voice: true si el agente respondió a ruido como si fuera el usuario hablando.
+- premature_termination: true si el agente colgó antes de que el usuario completara su intención.
+- user_sentiment: estado emocional percibido por la voz del usuario.
+- agent_wpm: tu estimación de palabras por minuto del agente (número entero).
+- avg_turn_gap_s: tiempo promedio estimado entre el fin del turno del usuario y el inicio del agente (segundos).
+- long_pauses: número de pausas >2s que escuchaste."""
 
 def build_system_prompt(agent_context):
     if agent_context and agent_context.strip():
@@ -91,15 +94,17 @@ def build_system_prompt(agent_context):
         context_block = ""
     return BASE_AUDIT_SYSTEM.format(context_block=context_block)
 
+# ── Secrets ───────────────────────────────────────────────────
 def get_secret(key):
     try:
         return st.secrets[key]
     except:
         return ""
 
-EL_KEY_DEFAULT  = get_secret("EL_KEY")
-ANT_KEY_DEFAULT = get_secret("ANT_KEY")
+EL_KEY_DEFAULT     = get_secret("EL_KEY")
+GEMINI_KEY_DEFAULT = get_secret("GEMINI_KEY")
 
+# ── ElevenLabs API helpers ────────────────────────────────────
 def api_req(url, headers, body=None):
     req = Request(url, headers=headers)
     if body:
@@ -141,17 +146,28 @@ def fetch_transcript(el_key, conv_id):
     data = api_req(f"https://api.elevenlabs.io/v1/convai/conversations/{conv_id}", {"xi-api-key": el_key})
     return data.get("transcript", [])
 
-def fetch_conversation_full(el_key, conv_id):
-    """Fetch full conversation data including transcript with timestamps."""
-    return api_req(f"https://api.elevenlabs.io/v1/convai/conversations/{conv_id}", {"xi-api-key": el_key})
+def check_has_audio(el_key, conv_id):
+    try:
+        data = api_req(f"https://api.elevenlabs.io/v1/convai/conversations/{conv_id}", {"xi-api-key": el_key})
+        return data.get("has_audio", False)
+    except:
+        return False
+
+def fetch_audio_bytes(el_key, conv_id):
+    try:
+        raw, _ = api_req_raw(
+            f"https://api.elevenlabs.io/v1/convai/conversations/{conv_id}/audio",
+            {"xi-api-key": el_key}
+        )
+        return raw
+    except:
+        return None
 
 def calculate_latency(transcript):
-    """Calculate agent response latency from transcript timestamps.
-    Returns: avg_latency_ms, max_latency_ms, latency_list"""
     latencies = []
     user_end = None
     for turn in transcript:
-        role = turn.get("role","")
+        role = turn.get("role", "")
         t = turn.get("time_in_call_secs")
         if t is None:
             continue
@@ -164,215 +180,102 @@ def calculate_latency(transcript):
             user_end = None
     if not latencies:
         return None, None, []
-    avg = round(sum(latencies)/len(latencies), 2)
-    mx  = round(max(latencies), 2)
-    return avg, mx, latencies
+    return round(sum(latencies)/len(latencies), 2), round(max(latencies), 2), latencies
 
-def check_has_audio(el_key, conv_id):
-    """Check if conversation has audio available."""
+# ── Gemini API helpers ────────────────────────────────────────
+def gemini_req(gemini_key, contents, system_instruction=None, max_tokens=1000):
+    """
+    Chama a Gemini API via REST (sem SDK, igual ao padrão do app).
+    Suporta conteúdo multimodal (texto + áudio inline_data).
+    """
+    import urllib.request
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={gemini_key}"
+
+    body = {
+        "contents": contents,
+        "generationConfig": {
+            "maxOutputTokens": max_tokens,
+            "temperature": 0.1,
+        }
+    }
+    if system_instruction:
+        body["system_instruction"] = {"parts": [{"text": system_instruction}]}
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
     try:
-        data = api_req(f"https://api.elevenlabs.io/v1/convai/conversations/{conv_id}", {"xi-api-key": el_key})
-        return data.get("has_audio", False)
-    except:
-        return False
+        with urllib.request.urlopen(req, timeout=120) as r:
+            data = json.loads(r.read())
+            candidates = data.get("candidates", [])
+            if not candidates:
+                raise Exception("Gemini retornou sem candidatos")
+            parts = candidates[0].get("content", {}).get("parts", [])
+            return "".join(p.get("text", "") for p in parts)
+    except urllib.error.HTTPError as e:
+        err_body = e.read()
+        try:
+            err_json = json.loads(err_body)
+            msg = err_json.get("error", {}).get("message", str(err_body))
+        except:
+            msg = str(err_body)
+        raise Exception(f"Gemini HTTP {e.code}: {msg}")
 
-def fetch_audio_bytes(el_key, conv_id):
-    """Fetch raw audio bytes from ElevenLabs."""
-    try:
-        raw, headers = api_req_raw(
-            f"https://api.elevenlabs.io/v1/convai/conversations/{conv_id}/audio",
-            {"xi-api-key": el_key}
-        )
-        return raw
-    except:
-        return None
+def audit_gemini(gemini_key, transcript, agent_context=""):
+    """Audita o conteúdo da chamada via Gemini (texto)."""
+    if not transcript:
+        return {"clasificacion": "abandonada", "score": 0, "template_errors": False,
+                "name_errors": False, "issues": ["Transcripción vacía"],
+                "resumen": "Sin contenido.", "recomendaciones": []}
 
-def transcribe_with_scribe(el_key, audio_bytes):
-    """Send audio to ElevenLabs Scribe v2 for detailed transcription with diarization."""
+    tx = "\n".join(
+        f"{'Agente' if t['role'] == 'agent' else 'Usuario'}: {t['message']}"
+        for t in transcript
+    )
+    system = build_system_prompt(agent_context)
+
+    contents = [{"role": "user", "parts": [{"text": f"Audita esta llamada:\n\n{tx}"}]}]
+    text = gemini_req(gemini_key, contents, system_instruction=system, max_tokens=1000)
+    clean = text.replace("```json", "").replace("```", "").strip()
+    return json.loads(clean)
+
+def audit_voice_gemini(gemini_key, audio_bytes):
+    """
+    Envia o áudio real diretamente ao Gemini para análise de qualidade de voz.
+    Sem intermediário — o Gemini escuta o .mp3 e avalia prosódia, ruido, gaps, etc.
+    """
     if not audio_bytes:
         return None
     try:
-        import urllib.request, uuid
-        boundary = uuid.uuid4().hex
-        CRLF = b"\r\n"
-
-        def field(name, value):
-            return (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}").encode() + CRLF
-
-        body = b""
-        body += field("model_id", "scribe_v2")
-        body += field("diarize", "true")
-        body += field("detect_speaker_roles", "true")
-        body += field("timestamps_granularity", "word")
-        body += field("tag_audio_events", "true")
-        body += (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.mp3\"\r\nContent-Type: audio/mpeg\r\n\r\n").encode()
-        body += audio_bytes + CRLF
-        body += f"--{boundary}--\r\n".encode()
-
-        url = f"https://api.elevenlabs.io/v1/speech-to-text"
-        req = urllib.request.Request(
-            url,
-            data=body,
-            headers={
-                "xi-api-key": el_key,
-                "Content-Type": f"multipart/form-data; boundary={boundary}",
-                "Accept": "application/json",
-                "User-Agent": "Mozilla/5.0"
-            },
-            method="POST"
-        )
-        with urllib.request.urlopen(req, timeout=90) as r:
-            return json.loads(r.read())
+        audio_b64 = base64.b64encode(audio_bytes).decode()
+        contents = [{
+            "role": "user",
+            "parts": [
+                {
+                    "inline_data": {
+                        "mime_type": "audio/mpeg",
+                        "data": audio_b64
+                    }
+                },
+                {
+                    "text": "Escucha este audio de llamada de call center y analiza la calidad de voz del agente. Devuelve SOLO el JSON solicitado."
+                }
+            ]
+        }]
+        text = gemini_req(gemini_key, contents, system_instruction=VOICE_AUDIT_SYSTEM, max_tokens=800)
+        clean = text.replace("```json", "").replace("```", "").strip()
+        return json.loads(clean)
     except Exception as e:
         return {"error": str(e)}
 
-# ── NOVA FUNÇÃO: extrai métricas acústicas reais do Scribe v2 ──────────────
-def extract_acoustic_metrics(scribe_result):
-    """Extrai métricas acústicas reais do resultado do Scribe v2."""
-    if not scribe_result or scribe_result.get("error"):
-        return {}
-
-    words = scribe_result.get("words", [])
-    if not words:
-        return {}
-
-    # Separa palavras por speaker
-    agent_words, user_words = [], []
-    agent_durations, user_durations = [], []
-
-    for w in words:
-        if w.get("type") != "word":
-            continue
-        speaker = w.get("speaker_id", "")
-        duration = w.get("end", 0) - w.get("start", 0)
-        # Heurística: speaker_0 geralmente é o agente (voz sintética)
-        if speaker in ("speaker_0", "agent", "A"):
-            agent_words.append(w)
-            agent_durations.append(duration)
-        else:
-            user_words.append(w)
-            user_durations.append(duration)
-
-    # Velocidade de fala (palavras por minuto)
-    def wpm(word_list):
-        if len(word_list) < 2:
-            return None
-        total_time = word_list[-1]["end"] - word_list[0]["start"]
-        if total_time <= 0:
-            return None
-        return round((len(word_list) / total_time) * 60, 1)
-
-    # Pausas entre turnos (gap entre último user e primeiro agent)
-    silences = []
-    prev_end = None
-    prev_speaker = None
-    for w in sorted(words, key=lambda x: x.get("start", 0)):
-        if w.get("type") != "word":
-            continue
-        curr_speaker = w.get("speaker_id", "")
-        curr_start = w.get("start", 0)
-        if prev_end is not None and curr_speaker != prev_speaker:
-            gap = curr_start - prev_end
-            if 0.1 < gap < 10:
-                silences.append(round(gap, 2))
-        prev_end = w.get("end", 0)
-        prev_speaker = curr_speaker
-
-    # Duración media de palabras del agente (proxy de velocidade artificial)
-    avg_agent_word_dur = round(sum(agent_durations) / len(agent_durations), 3) if agent_durations else None
-
-    return {
-        "agent_wpm": wpm(agent_words),
-        "user_wpm": wpm(user_words),
-        "avg_turn_gap_s": round(sum(silences) / len(silences), 2) if silences else None,
-        "max_turn_gap_s": max(silences) if silences else None,
-        "long_pauses": sum(1 for s in silences if s > 2.0),
-        "avg_agent_word_duration_ms": round(avg_agent_word_dur * 1000) if avg_agent_word_dur else None,
-        "total_agent_words": len(agent_words),
-        "total_user_words": len(user_words),
-    }
-
-def audit_claude(ant_key, transcript, agent_context=""):
-    if not transcript:
-        return {"clasificacion":"abandonada","score":0,"template_errors":False,"name_errors":False,
-                "issues":["Transcripción vacía"],"resumen":"Sin contenido.","recomendaciones":[]}
-    tx = "\n".join(f"{'Agente' if t['role']=='agent' else 'Usuario'}: {t['message']}" for t in transcript)
-    system = build_system_prompt(agent_context)
-    data = api_req("https://api.anthropic.com/v1/messages",
-        {"Content-Type":"application/json","x-api-key":ant_key,"anthropic-version":"2023-06-01"},
-        {"model":"claude-sonnet-4-5","max_tokens":1000,"system":system,
-         "messages":[{"role":"user","content":f"Audita esta llamada:\n\n{tx}"}]})
-    text = "".join(b["text"] for b in data.get("content",[]) if b["type"]=="text")
-    return json.loads(text.replace("```json","").replace("```","").strip())
-
-def audit_voice_claude(ant_key, scribe_result):
-    """Send Scribe enriched transcription + acoustic metrics to Claude for voice quality analysis."""
-    if not scribe_result or scribe_result.get("error"):
-        return None
-    try:
-        words = scribe_result.get("words", [])
-        enriched_lines = []
-        current_speaker = None
-        current_line = []
-        current_start = None
-
-        for w in words:
-            wtype = w.get("type", "word")
-            speaker = w.get("speaker_id", "unknown")
-            text = w.get("text", "")
-            start = w.get("start", 0)
-            end = w.get("end", 0)
-
-            if wtype == "audio_event":
-                if current_line:
-                    enriched_lines.append(f"[{current_speaker or 'Speaker'} @{current_start:.1f}s]: {' '.join(current_line)}")
-                    current_line = []
-                enriched_lines.append(f"[AUDIO_EVENT @{start:.1f}s]: {text}")
-                current_speaker = None
-                current_start = None
-            else:
-                if speaker != current_speaker:
-                    if current_line:
-                        enriched_lines.append(f"[{current_speaker or 'Speaker'} @{current_start:.1f}s]: {' '.join(current_line)}")
-                        current_line = []
-                    current_speaker = speaker
-                    current_start = start
-                current_line.append(text)
-
-        if current_line:
-            enriched_lines.append(f"[{current_speaker or 'Speaker'} @{current_start:.1f}s]: {' '.join(current_line)}")
-
-        enriched_tx = "\n".join(enriched_lines)
-
-        # Extrai métricas acústicas reais
-        acoustic = extract_acoustic_metrics(scribe_result)
-        acoustic_block = ""
-        if acoustic:
-            acoustic_block = f"""
-MÉTRICAS ACÚSTICAS REAIS (extraídas do áudio):
-- Velocidad de habla del agente: {acoustic.get('agent_wpm', '—')} palavras/min
-- Velocidad de habla del usuario: {acoustic.get('user_wpm', '—')} palavras/min
-- Gap promedio entre turnos: {acoustic.get('avg_turn_gap_s', '—')}s
-- Gap máximo entre turnos: {acoustic.get('max_turn_gap_s', '—')}s
-- Pausas largas (>2s): {acoustic.get('long_pauses', '—')}
-- Duración media de palabras del agente: {acoustic.get('avg_agent_word_duration_ms', '—')}ms
-- Total palabras agente: {acoustic.get('total_agent_words', '—')}
-- Total palabras usuario: {acoustic.get('total_user_words', '—')}
-"""
-
-        data = api_req("https://api.anthropic.com/v1/messages",
-            {"Content-Type":"application/json","x-api-key":ant_key,"anthropic-version":"2023-06-01"},
-            {"model":"claude-sonnet-4-5","max_tokens":800,"system":VOICE_AUDIT_SYSTEM,
-             "messages":[{"role":"user","content":f"Analiza la calidad de voz de esta llamada:\n\n{acoustic_block}\nTRANSCRIPCIÓN ENRIQUECIDA:\n{enriched_tx}"}]})
-        text = "".join(b["text"] for b in data.get("content",[]) if b["type"]=="text")
-        result = json.loads(text.replace("```json","").replace("```","").strip())
-        result["enriched_transcript"] = enriched_lines
-        result["acoustic_metrics"] = acoustic
-        return result
-    except Exception as e:
-        return {"error": str(e)}
-
+# ── Formatters ────────────────────────────────────────────────
 def fmt_dur(s): return f"{int(s)//60}m {int(s)%60}s" if s else "—"
+def fmt_dt(ts): return datetime.fromtimestamp(ts).strftime("%d/%m %H:%M") if ts else "—"
+def score_cls(s): return "score-high" if s >= 7 else "score-mid" if s >= 5 else "score-low"
 
 def content_alert_emoji(score, clf, r):
     if r.get("template_errors") or r.get("name_errors") or clf == "error_tecnico":
@@ -402,70 +305,69 @@ def audio_alert_emoji(voice):
     if warning:  return "🎙️🟡"
     return "🎙️🟢"
 
-def sentiment_emoji(sentiment):
-    return {
-        "satisfecho": "😊",
-        "neutro": "😐",
-        "frustrado": "😤",
-        "confuso": "😕",
-        "molesto": "😠"
-    }.get(sentiment, "")
+def sentiment_emoji(s):
+    return {"satisfecho": "😊", "neutro": "😐", "frustrado": "😤",
+            "confuso": "😕", "molesto": "😠"}.get(s, "")
 
 def noise_badge(level):
-    return {
-        "limpio": "🔇 limpio",
-        "leve":   "🔉 leve",
-        "moderado": "🔊 moderado",
-        "alto":   "📢 alto"
-    }.get(level, level)
-
-def fmt_dt(ts): return datetime.fromtimestamp(ts).strftime("%d/%m %H:%M") if ts else "—"
-def score_cls(s): return "score-high" if s>=7 else "score-mid" if s>=5 else "score-low"
+    return {"limpio": "🔇 limpio", "leve": "🔉 leve",
+            "moderado": "🔊 moderado", "alto": "📢 alto"}.get(level, level)
 
 def to_csv(rows):
-    buf = io.StringIO(); buf.write("\ufeff")
-    fields = ["id","agente","fecha","duracion","clasificacion","score",
-              "error_template","error_nombre","resumen","issues","recomendaciones",
-              "latencia_avg_s","latencia_max_s","voz_generativa","flujo_conversacional","interrupciones","ruido_fondo",
-              "ruido_confundido_voz","terminacion_prematura","qa_voz","sentimiento",
-              "agent_wpm","user_wpm","avg_turn_gap_s","max_turn_gap_s","long_pauses","avg_agent_word_duration_ms"]
+    buf = io.StringIO()
+    buf.write("\ufeff")
+    fields = ["id", "agente", "fecha", "duracion", "clasificacion", "score",
+              "error_template", "error_nombre", "resumen", "issues", "recomendaciones",
+              "latencia_avg_s", "latencia_max_s",
+              "voz_generativa", "flujo_conversacional", "interrupciones", "ruido_fondo",
+              "ruido_confundido_voz", "terminacion_prematura",
+              "agent_wpm", "avg_turn_gap_s", "long_pauses", "qa_voz", "sentimiento"]
     w = csv.DictWriter(buf, fieldnames=fields)
     w.writeheader()
-    for r in rows: w.writerow(r)
+    for r in rows:
+        w.writerow(r)
     return buf.getvalue()
 
-# ── Session state ─────────────────────────────────────────────
-for k,v in {"agents":[],"conversations":[],"selected_ids":set(),"audit_results":{},
-            "transcripts":{},"loaded":False,"agent_id":"","agent_name":"Todos",
-            "has_more":False,"cursor":None,"agent_context":{},"analyze_audio":True,
-            "audio_cache":{}}.items():
-    if k not in st.session_state: st.session_state[k] = v
+PILL = {"resuelta": "resuelta", "no_resuelta": "no resuelta", "escalada": "escalada",
+        "error_tecnico": "error técnico", "abandonada": "abandonada"}
 
-PILL = {"resuelta":"resuelta","no_resuelta":"no resuelta","escalada":"escalada",
-        "error_tecnico":"error técnico","abandonada":"abandonada"}
+# ── Session state ─────────────────────────────────────────────
+for k, v in {
+    "agents": [], "conversations": [], "selected_ids": set(),
+    "audit_results": {}, "transcripts": {}, "loaded": False,
+    "agent_id": "", "agent_name": "Todos",
+    "has_more": False, "cursor": None,
+    "agent_context": {}, "analyze_audio": True,
+    "audio_cache": {}
+}.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 # ── Sidebar ───────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 🎙️ Auditor de Smartons")
-    st.markdown("*ElevenLabs × Claude AI*")
+    st.markdown("*ElevenLabs × Gemini AI*")
     st.divider()
 
-    if EL_KEY_DEFAULT and ANT_KEY_DEFAULT:
-        el_key  = EL_KEY_DEFAULT
-        ant_key = ANT_KEY_DEFAULT
+    if EL_KEY_DEFAULT and GEMINI_KEY_DEFAULT:
+        el_key      = EL_KEY_DEFAULT
+        gemini_key  = GEMINI_KEY_DEFAULT
         st.success("🔐 API Keys configuradas")
     else:
-        el_key  = st.text_input("API Key de ElevenLabs", type="password", placeholder="xi-...")
-        ant_key = st.text_input("API Key de Anthropic",  type="password", placeholder="sk-ant-...")
+        el_key     = st.text_input("API Key de ElevenLabs", type="password", placeholder="xi-...")
+        gemini_key = st.text_input("API Key de Gemini (AI Studio)", type="password", placeholder="AIza...")
 
     st.divider()
     page_size = st.slider("Llamadas por carga", 10, 100, 30, 10)
 
-    analyze_audio = st.toggle("🎵 Analizar audio (Scribe v2)", value=st.session_state.analyze_audio,
-                               help="Usa ElevenLabs Scribe v2 para analizar calidad de voz, ruido, interrupciones y flujo. Tarda un poco más.")
+    analyze_audio = st.toggle(
+        "🎵 Analizar audio (Gemini nativo)",
+        value=st.session_state.analyze_audio,
+        help="Gemini recibe el archivo de audio directamente y evalúa prosodia, ruido, pausas y fluidez — sin Scribe v2."
+    )
     st.session_state.analyze_audio = analyze_audio
     if analyze_audio:
-        st.caption("Diarización + timestamps + métricas acústicas reales → Claude evalúa calidad de voz.")
+        st.caption("Gemini escucha el audio real → evalúa voz, ruido, interrupciones y flujo conversacional.")
 
     c1, c2 = st.columns(2)
     with c1:
@@ -474,7 +376,7 @@ with st.sidebar:
         more_btn = st.button("+ Más", use_container_width=True, disabled=not st.session_state.has_more)
 
     if load:
-        if not el_key or not ant_key:
+        if not el_key or not gemini_key:
             st.error("Completa las dos API Keys.")
         else:
             with st.spinner("Conectando..."):
@@ -495,7 +397,8 @@ with st.sidebar:
     if more_btn and st.session_state.has_more:
         with st.spinner("Cargando más..."):
             try:
-                more, cur, has = fetch_conversations(el_key, st.session_state.agent_id, page_size, st.session_state.cursor)
+                more, cur, has = fetch_conversations(
+                    el_key, st.session_state.agent_id, page_size, st.session_state.cursor)
                 st.session_state.conversations += more
                 st.session_state.cursor = cur
                 st.session_state.has_more = has
@@ -506,8 +409,12 @@ with st.sidebar:
     if st.session_state.agents:
         st.divider()
         st.markdown("**Filtrar por agente:**")
-        opts = {"": "— Todos —"} | {a["agent_id"]: a.get("name", a["agent_id"]) for a in st.session_state.agents}
-        sel = st.selectbox("Agente", list(opts.keys()), format_func=lambda x: opts[x], label_visibility="collapsed")
+        opts = {"": "— Todos —"} | {
+            a["agent_id"]: a.get("name", a["agent_id"])
+            for a in st.session_state.agents
+        }
+        sel = st.selectbox("Agente", list(opts.keys()),
+                           format_func=lambda x: opts[x], label_visibility="collapsed")
         if sel != st.session_state.agent_id:
             st.session_state.agent_id = sel
             st.session_state.agent_name = opts[sel]
@@ -523,11 +430,14 @@ with st.sidebar:
         if sel:
             st.divider()
             st.markdown("**🎯 Prompt del agente:**")
-            st.markdown("<div style='font-size:11px;color:#9e9e9a;margin-bottom:6px;'>Cargado automáticamente desde ElevenLabs.</div>", unsafe_allow_html=True)
+            st.markdown(
+                "<div style='font-size:11px;color:#9e9e9a;margin-bottom:6px;'>Cargado automáticamente desde ElevenLabs.</div>",
+                unsafe_allow_html=True
+            )
             current_ctx = st.session_state.agent_context.get(sel, "")
             new_ctx = st.text_area("Prompt", value=current_ctx,
-                placeholder="Se cargará automáticamente al seleccionar el agente.",
-                height=150, label_visibility="collapsed", key=f"ctx_{sel}")
+                                   placeholder="Se cargará automáticamente al seleccionar el agente.",
+                                   height=150, label_visibility="collapsed", key=f"ctx_{sel}")
             if new_ctx != current_ctx:
                 st.session_state.agent_context[sel] = new_ctx
             if st.button("🔄 Recargar prompt", use_container_width=True):
@@ -541,7 +451,16 @@ with st.sidebar:
                         st.warning("No se encontró prompt para este agente.")
 
     st.divider()
-    st.markdown("**Lo que se evalúa:**\n- 🤖 Clasificación\n- ⭐ Score 0–10\n- `{{` Errores de template\n- 👤 Errores de nombre\n- 🔍 Issues y recomendaciones\n- 🎵 Voz generativa (Scribe)\n- 🌊 Flujo conversacional\n- 🔇 Ruido de fondo\n- ✂️ Interrupciones\n- 📊 WPM · gaps · pausas")
+    st.markdown("""**Lo que se evalúa:**
+- 🤖 Clasificación y score
+- `{{` Errores de template y nombre
+- 🔍 Issues y recomendaciones
+- 😊 Sentimiento del usuario
+- 🎵 Voz generativa (audio real)
+- 🌊 Flujo conversacional
+- 🔇 Ruido de fondo
+- ✂️ Interrupciones
+- 📊 WPM · gaps · pausas""")
 
 # ── Main ──────────────────────────────────────────────────────
 st.title("Auditor de Smartons")
@@ -560,20 +479,24 @@ with tab1:
     with st.expander("🔍 Filtros", expanded=False):
         fc1, fc2 = st.columns(2)
         with fc1:
-            status_filter = st.selectbox("Status", ["todos","done","failed"],
-                format_func=lambda x: "Todos" if x=="todos" else x)
+            status_filter = st.selectbox("Status", ["todos", "done", "failed"],
+                                         format_func=lambda x: "Todos" if x == "todos" else x)
         with fc2:
             min_dur = st.slider("Duración mínima (seg)", 0, 300, 0, 10)
+
     convs_filtered = [c for c in convs if
-        (status_filter == "todos" or c.get("status") == status_filter) and
-        ((c.get("call_duration_secs") or 0) >= min_dur)
-    ]
+                      (status_filter == "todos" or c.get("status") == status_filter) and
+                      ((c.get("call_duration_secs") or 0) >= min_dur)]
+
     if len(convs_filtered) != len(convs):
         st.caption(f"Mostrando {len(convs_filtered)} de {len(convs)} llamadas")
 
     ctx = st.session_state.agent_context.get(st.session_state.agent_id, "")
     if ctx:
-        st.markdown(f'<div class="context-box">🎯 <strong>Objetivo activo:</strong> {ctx[:200]}{"..." if len(ctx)>200 else ""}</div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="context-box">🎯 <strong>Objetivo activo:</strong> {ctx[:200]}{"..." if len(ctx) > 200 else ""}</div>',
+            unsafe_allow_html=True
+        )
 
     c1, c2 = st.columns([2, 2])
     with c1:
@@ -594,9 +517,9 @@ with tab1:
 
     for conv in convs_filtered:
         cid = conv["conversation_id"]
-        agent_tag = f"🤖 `{conv.get('agent_id','')[:20]}`&nbsp;" if not st.session_state.agent_id else ""
-        dur = fmt_dur(conv.get("call_duration_secs"))
-        dt  = fmt_dt(conv.get("start_time_unix_secs"))
+        agent_tag = f"🤖 `{conv.get('agent_id', '')[:20]}`&nbsp;" if not st.session_state.agent_id else ""
+        dur  = fmt_dur(conv.get("call_duration_secs"))
+        dt   = fmt_dt(conv.get("start_time_unix_secs"))
         msgs = conv.get("message_count", "?")
 
         col_chk, col_info = st.columns([0.5, 9.5])
@@ -607,25 +530,25 @@ with tab1:
             else:
                 st.session_state.selected_ids.discard(cid)
         with col_info:
-            secs = conv.get("call_duration_secs") or 0
+            secs      = conv.get("call_duration_secs") or 0
             msg_count = conv.get("message_count") or 0
             pre_flags = []
             if msg_count == 0:
                 pre_flags.append(("⚠️", "sin mensajes", "#5c3a00", "#FAEEDA"))
             elif msg_count <= 2:
                 pre_flags.append(("💬", "muy corta", "#5c3a00", "#FAEEDA"))
-            if secs > 0 and secs < 20:
+            if 0 < secs < 20:
                 pre_flags.append(("⏱️", "<20s", "#5c3a00", "#FAEEDA"))
             elif secs > 300:
                 pre_flags.append(("⏱️", "+5min", "#5c3a00", "#FAEEDA"))
 
             audit = st.session_state.audit_results.get(cid)
             if audit and audit.get("status") == "done":
-                sc = audit.get("score", 0)
-                cl = audit.get("clasificacion", "")
+                sc  = audit.get("score", 0)
+                cl  = audit.get("clasificacion", "")
                 voice_r = audit.get("voice") or {}
-                ca = content_alert_emoji(sc, cl, audit)
-                aa = audio_alert_emoji(voice_r) if voice_r and not voice_r.get("error") else ""
+                ca  = content_alert_emoji(sc, cl, audit)
+                aa  = audio_alert_emoji(voice_r) if voice_r and not voice_r.get("error") else ""
                 result_badge = f'<span style="font-size:12px;font-weight:700;margin-right:6px;">{ca} {sc}/10 {aa}</span>'
             else:
                 result_badge = ""
@@ -635,7 +558,6 @@ with tab1:
                 for icon, label, fc, bg in pre_flags
             )
             left_badges = (result_badge + " " + flags_html).strip()
-
             st.markdown(
                 f"{left_badges}&nbsp; `{cid}` &nbsp; {agent_tag}🕐 {dur} &nbsp; 📅 {dt} &nbsp; 💬 {msgs} msgs",
                 unsafe_allow_html=True
@@ -645,56 +567,56 @@ with tab1:
         st.info("Hay más llamadas. Usa **+ Más** en la barra lateral.")
 
     st.divider()
-    n = len(st.session_state.selected_ids)
+    n  = len(st.session_state.selected_ids)
     ca, cb = st.columns([2, 8])
     with ca:
-        go = st.button(f"▶ Auditar {n} llamada{'s' if n!=1 else ''}",
-                       disabled=n==0, type="primary", use_container_width=True)
+        go = st.button(f"▶ Auditar {n} llamada{'s' if n != 1 else ''}",
+                       disabled=n == 0, type="primary", use_container_width=True)
     with cb:
         if n > 0:
             audio_label = " + análisis de voz 🎵" if st.session_state.analyze_audio else ""
             st.markdown(f"*{n} llamadas seleccionadas{audio_label}*")
 
     if go and n > 0:
-        ids = list(st.session_state.selected_ids)
+        ids       = list(st.session_state.selected_ids)
         agent_ctx = st.session_state.agent_context.get(st.session_state.agent_id, "")
-        prog = st.progress(0, text="Iniciando auditoría...")
+        prog      = st.progress(0, text="Iniciando auditoría...")
         st.session_state.audit_results = {}
 
         for i, cid in enumerate(ids):
-            prog.progress(i/len(ids), text=f"Evaluando {i+1}/{len(ids)}: `{cid[:35]}...`")
+            prog.progress(i / len(ids), text=f"Evaluando {i+1}/{len(ids)}: `{cid[:35]}...`")
             try:
                 tx = fetch_transcript(el_key, cid)
                 st.session_state.transcripts[cid] = tx
 
-                avg_lat, max_lat, lat_list = calculate_latency(tx)
+                avg_lat, max_lat, _ = calculate_latency(tx)
 
-                r = audit_claude(ant_key, tx, agent_ctx)
+                r = audit_gemini(gemini_key, tx, agent_ctx)
                 r["latency_avg_s"] = avg_lat
                 r["latency_max_s"] = max_lat
-                r["agent_id"] = next((c for c in convs if c["conversation_id"]==cid), {}).get("agent_id","")
+                r["agent_id"] = next(
+                    (c for c in convs if c["conversation_id"] == cid), {}
+                ).get("agent_id", "")
 
                 if st.session_state.analyze_audio:
-                    prog.progress(i/len(ids), text=f"Verificando audio {i+1}/{len(ids)}: `{cid[:30]}...`")
-                    has_audio = check_has_audio(el_key, cid)
+                    prog.progress(i / len(ids), text=f"Verificando audio {i+1}/{len(ids)}...")
+                    has_audio   = check_has_audio(el_key, cid)
                     audio_bytes = fetch_audio_bytes(el_key, cid) if has_audio else None
                     if audio_bytes:
                         st.session_state.audio_cache[cid] = base64.b64encode(audio_bytes).decode()
-                        prog.progress(i/len(ids), text=f"Transcribiendo con Scribe {i+1}/{len(ids)}...")
-                        scribe = transcribe_with_scribe(el_key, audio_bytes)
-                        if scribe and not scribe.get("error"):
-                            prog.progress(i/len(ids), text=f"Analizando voz {i+1}/{len(ids)}...")
-                            voice = audit_voice_claude(ant_key, scribe)
-                            r["voice"] = voice
-                        else:
-                            r["voice"] = scribe
+                        prog.progress(i / len(ids), text=f"Gemini analizando voz {i+1}/{len(ids)}...")
+                        voice = audit_voice_gemini(gemini_key, audio_bytes)
+                        r["voice"] = voice
                     else:
                         r["voice"] = None
 
-                st.session_state.audit_results[cid] = {"status":"done", **r}
+                st.session_state.audit_results[cid] = {"status": "done", **r}
+
             except Exception as e:
-                st.session_state.audit_results[cid] = {"status":"error","error":str(e)}
-            if i < len(ids)-1: time.sleep(0.5)
+                st.session_state.audit_results[cid] = {"status": "error", "error": str(e)}
+
+            if i < len(ids) - 1:
+                time.sleep(0.3)
 
         prog.progress(1.0, text=f"✅ {len(ids)} llamadas evaluadas!")
         st.balloons()
@@ -702,171 +624,171 @@ with tab1:
 
 # ── TAB 2 ─────────────────────────────────────────────────────
 with tab2:
-    res = {k:v for k,v in st.session_state.audit_results.items() if v.get("status")=="done"}
+    res = {k: v for k, v in st.session_state.audit_results.items() if v.get("status") == "done"}
     if not res:
-        st.info("Ninguna auditoría realizada aún."); st.stop()
+        st.info("Ninguna auditoría realizada aún.")
+        st.stop()
 
     done = list(res.values())
-    avg  = sum(r.get("score",0) for r in done)/len(done)
-    resueltas    = sum(1 for r in done if r.get("clasificacion")=="resuelta")
+    avg  = sum(r.get("score", 0) for r in done) / len(done)
+    resueltas    = sum(1 for r in done if r.get("clasificacion") == "resuelta")
     issues_count = sum(1 for r in done if r.get("issues"))
     tpl          = sum(1 for r in done if r.get("template_errors"))
 
     voice_results = [r["voice"] for r in done if r.get("voice") and not r["voice"].get("error")]
-    avg_voz   = sum(v.get("generative_voice_score",0) for v in voice_results)/len(voice_results) if voice_results else None
-    avg_flujo = sum(v.get("conversational_flow_score",0) for v in voice_results)/len(voice_results) if voice_results else None
+    avg_voz   = sum(v.get("generative_voice_score", 0) for v in voice_results) / len(voice_results) if voice_results else None
+    avg_flujo = sum(v.get("conversational_flow_score", 0) for v in voice_results) / len(voice_results) if voice_results else None
     noise_issues = sum(1 for v in voice_results if v.get("noise_confused_with_voice")) if voice_results else 0
 
-    # Métricas acústicas agregadas
-    acoustic_results = [r["voice"].get("acoustic_metrics",{}) for r in done if r.get("voice") and not r["voice"].get("error") and r["voice"].get("acoustic_metrics")]
-    avg_agent_wpm = round(sum(a["agent_wpm"] for a in acoustic_results if a.get("agent_wpm")) / len([a for a in acoustic_results if a.get("agent_wpm")]), 1) if any(a.get("agent_wpm") for a in acoustic_results) else None
-    avg_gap = round(sum(a["avg_turn_gap_s"] for a in acoustic_results if a.get("avg_turn_gap_s")) / len([a for a in acoustic_results if a.get("avg_turn_gap_s")]), 2) if any(a.get("avg_turn_gap_s") for a in acoustic_results) else None
+    avg_agent_wpm = None
+    avg_gap       = None
+    wpm_vals = [v.get("agent_wpm") for v in voice_results if isinstance(v.get("agent_wpm"), (int, float))]
+    gap_vals = [v.get("avg_turn_gap_s") for v in voice_results if isinstance(v.get("avg_turn_gap_s"), (int, float))]
+    if wpm_vals: avg_agent_wpm = round(sum(wpm_vals) / len(wpm_vals), 1)
+    if gap_vals: avg_gap       = round(sum(gap_vals) / len(gap_vals), 2)
 
     metrics_html = f"""<div class="metric-row">
-      <div class="metric-box"><div class="label">Score promedio</div><div class="value">{avg:.1f}</div><div class="sub">de 10</div></div>
-      <div class="metric-box"><div class="label">Resueltas</div><div class="value">{resueltas}</div><div class="sub">de {len(done)}</div></div>
-      <div class="metric-box"><div class="label">Con issues</div><div class="value">{issues_count}</div><div class="sub">llamadas</div></div>
-      <div class="metric-box"><div class="label">Error template</div><div class="value">{tpl}</div><div class="sub">detectados</div></div>"""
+  <div class="metric-box"><div class="label">Score promedio</div><div class="value">{avg:.1f}</div><div class="sub">de 10</div></div>
+  <div class="metric-box"><div class="label">Resueltas</div><div class="value">{resueltas}</div><div class="sub">de {len(done)}</div></div>
+  <div class="metric-box"><div class="label">Con issues</div><div class="value">{issues_count}</div><div class="sub">llamadas</div></div>
+  <div class="metric-box"><div class="label">Error template</div><div class="value">{tpl}</div><div class="sub">detectados</div></div>"""
     if avg_voz is not None:
         metrics_html += f"""
-      <div class="metric-box"><div class="label">🎵 Voz generativa</div><div class="value">{avg_voz:.1f}</div><div class="sub">promedio</div></div>
-      <div class="metric-box"><div class="label">🌊 Flujo conv.</div><div class="value">{avg_flujo:.1f}</div><div class="sub">promedio</div></div>
-      <div class="metric-box"><div class="label">🔇 Ruido→voz</div><div class="value">{noise_issues}</div><div class="sub">llamadas</div></div>"""
+  <div class="metric-box"><div class="label">🎵 Voz generativa</div><div class="value">{avg_voz:.1f}</div><div class="sub">promedio</div></div>
+  <div class="metric-box"><div class="label">🌊 Flujo conv.</div><div class="value">{avg_flujo:.1f}</div><div class="sub">promedio</div></div>
+  <div class="metric-box"><div class="label">🔇 Ruido→voz</div><div class="value">{noise_issues}</div><div class="sub">llamadas</div></div>"""
     if avg_agent_wpm is not None:
         metrics_html += f"""
-      <div class="metric-box"><div class="label">📊 WPM agente</div><div class="value">{avg_agent_wpm}</div><div class="sub">palabras/min</div></div>"""
+  <div class="metric-box"><div class="label">📊 WPM agente</div><div class="value">{avg_agent_wpm}</div><div class="sub">palabras/min</div></div>"""
     if avg_gap is not None:
         metrics_html += f"""
-      <div class="metric-box"><div class="label">⏱ Gap promedio</div><div class="value">{avg_gap}s</div><div class="sub">entre turnos</div></div>"""
+  <div class="metric-box"><div class="label">⏱ Gap promedio</div><div class="value">{avg_gap}s</div><div class="sub">entre turnos</div></div>"""
     metrics_html += "</div>"
     st.markdown(metrics_html, unsafe_allow_html=True)
 
     if st.button("← Nueva evaluación", type="secondary"):
-        for key in ["conversations","selected_ids","audit_results","transcripts",
-                    "audio_cache","loaded","agent_id","agent_name","agents",
-                    "has_more","cursor","agent_context"]:
+        for key in ["conversations", "selected_ids", "audit_results", "transcripts",
+                    "audio_cache", "loaded", "agent_id", "agent_name", "agents",
+                    "has_more", "cursor", "agent_context"]:
             if key in st.session_state:
-                if isinstance(st.session_state[key], set):
-                    st.session_state[key] = set()
-                elif isinstance(st.session_state[key], dict):
-                    st.session_state[key] = {}
-                elif isinstance(st.session_state[key], list):
-                    st.session_state[key] = []
-                elif isinstance(st.session_state[key], bool):
-                    st.session_state[key] = False
-                else:
-                    st.session_state[key] = ""
+                v = st.session_state[key]
+                if isinstance(v, set):   st.session_state[key] = set()
+                elif isinstance(v, dict):  st.session_state[key] = {}
+                elif isinstance(v, list):  st.session_state[key] = []
+                elif isinstance(v, bool):  st.session_state[key] = False
+                else:                      st.session_state[key] = ""
         st.rerun()
 
-    if not st.session_state.get("is_auditing", False) and len(res) > 1:
+    if len(res) > 1:
         with st.expander("📋 Tabla resumen de todas las llamadas", expanded=False):
             import pandas as pd
-            PILL_SHORT = {"resuelta":"✅","no_resuelta":"❌","escalada":"↗","error_tecnico":"⚠️","abandonada":"📵"}
+            PILL_SHORT = {"resuelta": "✅", "no_resuelta": "❌", "escalada": "↗",
+                          "error_tecnico": "⚠️", "abandonada": "📵"}
             rows = []
             for cid2, r2 in res.items():
-                conv2 = next((c for c in convs if c["conversation_id"]==cid2), {})
+                conv2  = next((c for c in convs if c["conversation_id"] == cid2), {})
                 voice2 = r2.get("voice") or {}
                 has_v2 = bool(voice2 and not voice2.get("error"))
-                ac2 = voice2.get("acoustic_metrics", {}) if has_v2 else {}
                 rows.append({
-                    "Llamada": cid2[:20]+"...",
-                    "Fecha": fmt_dt(conv2.get("start_time_unix_secs")),
-                    "Duración": fmt_dur(conv2.get("call_duration_secs")),
-                    "Estado": PILL_SHORT.get(r2.get("clasificacion",""),"?") + " " + PILL.get(r2.get("clasificacion",""),""),
-                    "Score": r2.get("score","—"),
-                    "Latencia avg": f"{r2.get('latency_avg_s','—')}s" if r2.get('latency_avg_s') else "—",
-                    "Sentimiento": (r2.get("sentimiento",{}) or {}).get("estado","—"),
-                    "Voz": voice2.get("generative_voice_score","—") if has_v2 else "—",
-                    "Flujo": voice2.get("conversational_flow_score","—") if has_v2 else "—",
-                    "Ruido": voice2.get("background_noise_level","—") if has_v2 else "—",
-                    "WPM agente": ac2.get("agent_wpm","—"),
-                    "Gap avg (s)": ac2.get("avg_turn_gap_s","—"),
-                    "Pausas largas": ac2.get("long_pauses","—"),
-                    "Template ⚠": "sí" if r2.get("template_errors") else "no",
+                    "Llamada":      cid2[:20] + "...",
+                    "Fecha":        fmt_dt(conv2.get("start_time_unix_secs")),
+                    "Duración":     fmt_dur(conv2.get("call_duration_secs")),
+                    "Estado":       PILL_SHORT.get(r2.get("clasificacion", ""), "?") + " " + PILL.get(r2.get("clasificacion", ""), ""),
+                    "Score":        r2.get("score", "—"),
+                    "Latencia avg": f"{r2.get('latency_avg_s', '—')}s" if r2.get("latency_avg_s") else "—",
+                    "Sentimiento":  (r2.get("sentimiento", {}) or {}).get("estado", "—"),
+                    "Voz":          voice2.get("generative_voice_score", "—") if has_v2 else "—",
+                    "Flujo":        voice2.get("conversational_flow_score", "—") if has_v2 else "—",
+                    "Ruido":        voice2.get("background_noise_level", "—") if has_v2 else "—",
+                    "WPM agente":   voice2.get("agent_wpm", "—") if has_v2 else "—",
+                    "Gap avg (s)":  voice2.get("avg_turn_gap_s", "—") if has_v2 else "—",
+                    "Pausas largas": voice2.get("long_pauses", "—") if has_v2 else "—",
+                    "Template ⚠":  "sí" if r2.get("template_errors") else "no",
                 })
-            df = pd.DataFrame(rows)
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-    FL = {"todas":"Todas","resuelta":"✅ Resueltas","no_resuelta":"❌ No resueltas",
-          "escalada":"↗ Escaladas","error_tecnico":"⚠️ Error técnico","abandonada":"📵 Abandonadas"}
+    FL = {"todas": "Todas", "resuelta": "✅ Resueltas", "no_resuelta": "❌ No resueltas",
+          "escalada": "↗ Escaladas", "error_tecnico": "⚠️ Error técnico", "abandonada": "📵 Abandonadas"}
     ca, cb = st.columns(2)
-    with ca: filt = st.selectbox("Filtrar:", list(FL.keys()), format_func=lambda x: FL[x])
+    with ca:
+        filt = st.selectbox("Filtrar:", list(FL.keys()), format_func=lambda x: FL[x])
     with cb:
-        agents_in = list(set(r.get("agent_id","") for r in done if r.get("agent_id")))
-        af = st.selectbox("Agente:", ["todos"]+agents_in,
-             format_func=lambda x: "— Todos —" if x=="todos" else x) if len(agents_in)>1 else "todos"
+        agents_in = list(set(r.get("agent_id", "") for r in done if r.get("agent_id")))
+        af = st.selectbox("Agente:", ["todos"] + agents_in,
+                          format_func=lambda x: "— Todos —" if x == "todos" else x) if len(agents_in) > 1 else "todos"
 
     csv_rows = []
     for cid, r in res.items():
-        clf = r.get("clasificacion","")
-        if filt!="todas" and clf!=filt: continue
-        if af!="todos" and r.get("agent_id","")!=af: continue
+        clf = r.get("clasificacion", "")
+        if filt != "todas" and clf != filt: continue
+        if af != "todos" and r.get("agent_id", "") != af: continue
 
-        conv  = next((c for c in convs if c["conversation_id"]==cid), {})
-        dur   = fmt_dur(conv.get("call_duration_secs"))
-        dt    = fmt_dt(conv.get("start_time_unix_secs"))
-        score = r.get("score",0)
-        voice = r.get("voice") or {}
+        conv      = next((c for c in convs if c["conversation_id"] == cid), {})
+        dur       = fmt_dur(conv.get("call_duration_secs"))
+        dt        = fmt_dt(conv.get("start_time_unix_secs"))
+        score     = r.get("score", 0)
+        voice     = r.get("voice") or {}
         has_voice = bool(voice and not voice.get("error"))
         audio_b64 = st.session_state.audio_cache.get(cid)
-        acoustic = voice.get("acoustic_metrics", {}) if has_voice else {}
 
         warn = "".join([
             '<span class="pill pill-warn">⚠ template</span> ' if r.get("template_errors") else "",
-            '<span class="pill pill-warn">⚠ nombre</span>'    if r.get("name_errors")     else "",
-            '<span class="audio-badge">🎵 Scribe</span>'      if has_voice else ""
+            '<span class="pill pill-warn">⚠ nombre</span>'    if r.get("name_errors") else "",
+            '<span class="gemini-badge">✨ Gemini Audio</span>' if has_voice else ""
         ])
 
         content_alert = content_alert_emoji(score, clf, r)
-        audio_alert = audio_alert_emoji(voice) if has_voice else ""
-        sentiment = voice.get("user_sentiment","") if has_voice else ""
-        sent_icon = sentiment_emoji(sentiment)
-        noise_lvl = voice.get("background_noise_level","") if has_voice else ""
-        noise_info = f"  {noise_badge(noise_lvl)}" if noise_lvl and noise_lvl != "limpio" else ""
+        audio_alert   = audio_alert_emoji(voice) if has_voice else ""
+        sentiment     = voice.get("user_sentiment", "") if has_voice else (r.get("sentimiento") or {}).get("estado", "")
+        sent_icon     = sentiment_emoji(sentiment)
+        noise_lvl     = voice.get("background_noise_level", "") if has_voice else ""
+        noise_info    = f"  {noise_badge(noise_lvl)}" if noise_lvl and noise_lvl != "limpio" else ""
         audio_section = f"  |  {audio_alert}{noise_info}{' ' + sent_icon if sent_icon else ''}" if has_voice else ""
-        title = f"{content_alert} Score {score}/10 — {PILL.get(clf,clf)}  •  {cid[:28]}  •  {dur}{audio_section}"
+
+        title = f"{content_alert} Score {score}/10 — {PILL.get(clf, clf)}  •  {cid[:28]}  •  {dur}{audio_section}"
+
         with st.expander(title.strip()):
-            st.write(r.get("resumen",""))
-            lat_avg = r.get("latency_avg_s")
+            st.write(r.get("resumen", ""))
+            lat_avg   = r.get("latency_avg_s")
             lat_badge = f"&nbsp; ⚡ {lat_avg}s latencia" if lat_avg is not None else ""
-            lat_html = f'<span style="font-size:11px;font-weight:700;color:#ffffff;">{lat_badge}</span>' if lat_avg else ""
-            st.markdown(f"""<div><span class="pill pill-{clf}">{PILL.get(clf,clf)}</span> &nbsp;
+            lat_html  = f'<span style="font-size:11px;font-weight:700;color:#ffffff;">{lat_badge}</span>' if lat_avg else ""
+            st.markdown(f"""<div><span class="pill pill-{clf}">{PILL.get(clf, clf)}</span> &nbsp;
 <span class="{score_cls(score)}">{score}/10</span> &nbsp; {warn} &nbsp; 🕐 {dur} &nbsp; 📅 {dt} {lat_html}</div>
 """, unsafe_allow_html=True)
 
             if audio_b64:
                 st.markdown("**🎵 Audio de la llamada:**")
-                audio_bytes_play = base64.b64decode(audio_b64)
-                st.audio(audio_bytes_play, format="audio/mp3")
+                st.audio(base64.b64decode(audio_b64), format="audio/mp3")
 
+            # Sentimiento (desde audit de contenido)
             sent = r.get("sentimiento") or {}
             if sent and isinstance(sent, dict):
-                SENT_EMOJI = {"satisfecho":"😊","neutro":"😐","frustrado":"😤","confuso":"😕","molesto":"😠"}
-                SENT_COLOR = {"satisfecho":"#EAF3DE","neutro":"#f5f5f3","frustrado":"#FAEEDA","confuso":"#E6F1FB","molesto":"#FCEBEB"}
-                SENT_TEXT  = {"satisfecho":"#27500A","neutro":"#444441","frustrado":"#633806","confuso":"#0C447C","molesto":"#791F1F"}
-                INT_LABEL  = {"leve":"leve","moderado":"moderado","intenso":"intenso"}
-                estado = sent.get("estado","neutro")
-                intensidad = sent.get("intensidad","leve")
-                detalle = sent.get("detalle","")
-                emoji = SENT_EMOJI.get(estado,"😐")
-                bg = SENT_COLOR.get(estado,"#f5f5f3")
-                tc = SENT_TEXT.get(estado,"#444441")
+                SENT_EMOJI = {"satisfecho": "😊", "neutro": "😐", "frustrado": "😤", "confuso": "😕", "molesto": "😠"}
+                SENT_COLOR = {"satisfecho": "#EAF3DE", "neutro": "#f5f5f3", "frustrado": "#FAEEDA", "confuso": "#E6F1FB", "molesto": "#FCEBEB"}
+                SENT_TEXT  = {"satisfecho": "#27500A", "neutro": "#444441", "frustrado": "#633806", "confuso": "#0C447C", "molesto": "#791F1F"}
+                estado     = sent.get("estado", "neutro")
+                intensidad = sent.get("intensidad", "leve")
+                detalle    = sent.get("detalle", "")
+                bg = SENT_COLOR.get(estado, "#f5f5f3")
+                tc = SENT_TEXT.get(estado, "#444441")
                 st.markdown(f'''<div style="background:{bg};border-radius:8px;padding:10px 14px;margin:8px 0;">
-  <span style="font-size:13px;font-weight:700;color:{tc};">{emoji} {estado.upper()}</span>
-  <span style="font-size:11px;color:{tc};margin-left:8px;opacity:0.8;">· {INT_LABEL.get(intensidad,intensidad)}</span>
+  <span style="font-size:13px;font-weight:700;color:{tc};">{SENT_EMOJI.get(estado,"😐")} {estado.upper()}</span>
+  <span style="font-size:11px;color:{tc};margin-left:8px;opacity:0.8;">· {intensidad}</span>
   <div style="font-size:12px;color:{tc};margin-top:4px;opacity:0.9;">{detalle}</div>
 </div>''', unsafe_allow_html=True)
 
             issues = r.get("issues", [])
-            if issues and isinstance(issues, list):
+            if issues:
                 st.markdown("**Issues:**")
-                issues_html = " ".join(f'<span class="issue-tag">⚠ {str(i)}</span>' for i in issues if isinstance(i, str))
-                st.markdown(issues_html, unsafe_allow_html=True)
+                st.markdown(" ".join(
+                    f'<span class="issue-tag">⚠ {str(i)}</span>'
+                    for i in issues if isinstance(i, str)
+                ), unsafe_allow_html=True)
 
             recs = r.get("recomendaciones", [])
-            if recs and isinstance(recs, list):
+            if recs:
                 st.markdown("**Recomendaciones:**")
-                PRIO_ICON = {"alta": "🔴", "media": "🟡", "baja": "🟢"}
+                PRIO_ICON  = {"alta": "🔴", "media": "🟡", "baja": "🟢"}
                 PRIO_LABEL = {"alta": "ALTA", "media": "MEDIA", "baja": "BAJA"}
                 for rc in recs:
                     if isinstance(rc, dict):
@@ -875,9 +797,7 @@ with tab2:
                     else:
                         texto = str(rc)
                         prio  = "media"
-                    icon = PRIO_ICON.get(prio, "🟡")
-                    label = PRIO_LABEL.get(prio, "MEDIA")
-                    st.markdown(f"{icon} **{label}** — {texto}")
+                    st.markdown(f"{PRIO_ICON.get(prio,'🟡')} **{PRIO_LABEL.get(prio,'MEDIA')}** — {texto}")
 
             if has_voice:
                 vg  = voice.get("generative_voice_score", "—")
@@ -887,99 +807,76 @@ with tab2:
                 vnc = "✅ No" if not voice.get("noise_confused_with_voice") else "⚠️ Sí"
                 vpt = "✅ No" if not voice.get("premature_termination") else "⚠️ Sí"
                 vqa = voice.get("voice_qa_reasoning", "")
+                v_wpm    = voice.get("agent_wpm", "—")
+                v_gap    = voice.get("avg_turn_gap_s", "—")
+                v_pauses = voice.get("long_pauses", "—")
 
-                def vc(v): return "vm-high" if isinstance(v,int) and v>=7 else "vm-mid" if isinstance(v,int) and v>=5 else "vm-low"
+                def vc(v): return "vm-high" if isinstance(v, int) and v >= 7 else "vm-mid" if isinstance(v, int) and v >= 5 else "vm-low"
+                def wpm_cls(v): return "vm-high" if isinstance(v, (int, float)) and 110 <= v <= 160 else "vm-low" if isinstance(v, (int, float)) and (v > 180 or v < 90) else "vm-mid"
+                def gap_cls(v): return "vm-high" if isinstance(v, (int, float)) and v <= 1.5 else "vm-mid" if isinstance(v, (int, float)) and v <= 2.5 else "vm-low"
 
                 st.markdown(f"""<div class="voice-section">
-  <div class="voice-section-title">🎵 Análisis de voz (Scribe v2)</div>
+  <div class="voice-section-title">✨ Análisis de voz (Gemini Audio)</div>
   <div class="voice-metric"><span class="vm-label">Voz generativa</span><span class="vm-val {vc(vg)}">{vg}/10</span></div>
   <div class="voice-metric"><span class="vm-label">Flujo conversacional</span><span class="vm-val {vc(vf)}">{vf}/10</span></div>
   <div class="voice-metric"><span class="vm-label">Interrupciones</span><span class="vm-val {vc(vi)}">{vi}/10</span></div>
   <div class="voice-metric"><span class="vm-label">Ruido de fondo</span><span class="vm-val">{vn}</span></div>
   <div class="voice-metric"><span class="vm-label">Ruido confundido con voz</span><span class="vm-val">{vnc}</span></div>
   <div class="voice-metric"><span class="vm-label">Terminación prematura</span><span class="vm-val">{vpt}</span></div>
-  <div class="voice-metric"><span class="vm-label">Sentimiento del usuario</span><span class="vm-val">{sent_icon} {sentiment}</span></div>
+  <div class="voice-metric"><span class="vm-label">Velocidad agente (WPM)</span><span class="vm-val {wpm_cls(v_wpm)}">{v_wpm} wpm</span></div>
+  <div class="voice-metric"><span class="vm-label">Gap promedio entre turnos</span><span class="vm-val {gap_cls(v_gap)}">{v_gap}s</span></div>
+  <div class="voice-metric"><span class="vm-label">Pausas largas (&gt;2s)</span><span class="vm-val {'vm-low' if isinstance(v_pauses,int) and v_pauses>2 else 'vm-high' if isinstance(v_pauses,int) else ''}">{v_pauses}</span></div>
+  <div class="voice-metric"><span class="vm-label">Sentimiento del usuario</span><span class="vm-val">{sentiment_emoji(voice.get('user_sentiment',''))} {voice.get('user_sentiment','—')}</span></div>
   {"<div style='font-size:12px;color:#6b6b67;margin-top:8px;'>" + vqa + "</div>" if vqa else ""}
 </div>""", unsafe_allow_html=True)
-
-                # Métricas acústicas reales
-                if acoustic:
-                    agent_wpm_val = acoustic.get('agent_wpm', '—')
-                    user_wpm_val  = acoustic.get('user_wpm', '—')
-                    gap_avg_val   = acoustic.get('avg_turn_gap_s', '—')
-                    gap_max_val   = acoustic.get('max_turn_gap_s', '—')
-                    pauses_val    = acoustic.get('long_pauses', '—')
-                    word_dur_val  = acoustic.get('avg_agent_word_duration_ms', '—')
-
-                    def wpm_cls(v):
-                        if not isinstance(v, (int, float)): return ""
-                        if 110 <= v <= 160: return "vm-high"
-                        if v > 180 or v < 90: return "vm-low"
-                        return "vm-mid"
-
-                    def gap_cls(v):
-                        if not isinstance(v, (int, float)): return ""
-                        if v <= 1.5: return "vm-high"
-                        if v <= 2.5: return "vm-mid"
-                        return "vm-low"
-
-                    st.markdown(f"""<div class="voice-section" style="margin-top:8px;background:#f0fff4;border-left-color:#27ae60;">
-  <div class="voice-section-title" style="color:#1a6b3a;">📊 Métricas acústicas reales</div>
-  <div class="voice-metric"><span class="vm-label">Velocidad de habla agente</span><span class="vm-val {wpm_cls(agent_wpm_val)}">{agent_wpm_val} wpm</span></div>
-  <div class="voice-metric"><span class="vm-label">Velocidad de habla usuario</span><span class="vm-val">{user_wpm_val} wpm</span></div>
-  <div class="voice-metric"><span class="vm-label">Gap promedio entre turnos</span><span class="vm-val {gap_cls(gap_avg_val)}">{gap_avg_val}s</span></div>
-  <div class="voice-metric"><span class="vm-label">Gap máximo</span><span class="vm-val {gap_cls(gap_max_val)}">{gap_max_val}s</span></div>
-  <div class="voice-metric"><span class="vm-label">Pausas largas (&gt;2s)</span><span class="vm-val {'vm-low' if isinstance(pauses_val,int) and pauses_val>2 else 'vm-high' if isinstance(pauses_val,int) else ''}">{pauses_val}</span></div>
-  <div class="voice-metric"><span class="vm-label">Duración media palabras agente</span><span class="vm-val">{word_dur_val}ms</span></div>
-</div>""", unsafe_allow_html=True)
-
-                enriched = voice.get("enriched_transcript", [])
-                if enriched:
-                    with st.expander("🕐 Transcripción con timestamps (Scribe)"):
-                        for line in enriched:
-                            if "AUDIO_EVENT" in line:
-                                st.markdown(f"<span class='stt-event'>{line}</span>", unsafe_allow_html=True)
-                            else:
-                                st.markdown(line)
 
             elif voice.get("error"):
                 st.caption(f"⚠️ No se pudo analizar el audio: {voice['error']}")
 
-            tx = st.session_state.transcripts.get(cid,[])
+            tx = st.session_state.transcripts.get(cid, [])
             if tx:
                 with st.expander("Ver transcripción"):
                     for l in tx:
-                        st.markdown(f"{'**Agente:**' if l['role']=='agent' else '*Usuario:*'} {l['message']}")
+                        st.markdown(
+                            f"{'**Agente:**' if l['role'] == 'agent' else '*Usuario:*'} {l['message']}"
+                        )
 
-        csv_rows.append({"id":cid,"agente":r.get("agent_id",""),"fecha":dt,"duracion":dur,
-            "clasificacion":clf,"score":score,
-            "error_template":"sí" if r.get("template_errors") else "no",
-            "error_nombre":"sí" if r.get("name_errors") else "no",
-            "resumen":r.get("resumen",""),
-            "issues":" | ".join(str(i) for i in r.get("issues",[]) if isinstance(i,str)),
-            "latencia_avg_s": r.get("latency_avg_s",""),
-            "latencia_max_s": r.get("latency_max_s",""),
-            "recomendaciones":" | ".join(
-                (rc.get("texto","") + " [" + rc.get("prioridad","") + "]") if isinstance(rc, dict) else str(rc)
-                for rc in r.get("recomendaciones",[])
+        csv_rows.append({
+            "id": cid,
+            "agente": r.get("agent_id", ""),
+            "fecha": dt,
+            "duracion": dur,
+            "clasificacion": clf,
+            "score": score,
+            "error_template": "sí" if r.get("template_errors") else "no",
+            "error_nombre":   "sí" if r.get("name_errors") else "no",
+            "resumen": r.get("resumen", ""),
+            "issues": " | ".join(str(i) for i in r.get("issues", []) if isinstance(i, str)),
+            "recomendaciones": " | ".join(
+                (rc.get("texto", "") + " [" + rc.get("prioridad", "") + "]") if isinstance(rc, dict) else str(rc)
+                for rc in r.get("recomendaciones", [])
             ),
-            "voz_generativa": voice.get("generative_voice_score","") if has_voice else "",
-            "flujo_conversacional": voice.get("conversational_flow_score","") if has_voice else "",
-            "interrupciones": voice.get("interruption_score","") if has_voice else "",
-            "ruido_fondo": voice.get("background_noise_level","") if has_voice else "",
+            "latencia_avg_s": r.get("latency_avg_s", ""),
+            "latencia_max_s": r.get("latency_max_s", ""),
+            "voz_generativa":       voice.get("generative_voice_score", "")   if has_voice else "",
+            "flujo_conversacional": voice.get("conversational_flow_score", "") if has_voice else "",
+            "interrupciones":       voice.get("interruption_score", "")        if has_voice else "",
+            "ruido_fondo":          voice.get("background_noise_level", "")    if has_voice else "",
             "ruido_confundido_voz": "sí" if has_voice and voice.get("noise_confused_with_voice") else "no" if has_voice else "",
             "terminacion_prematura": "sí" if has_voice and voice.get("premature_termination") else "no" if has_voice else "",
-            "qa_voz": voice.get("voice_qa_reasoning","") if has_voice else "",
-            "sentimiento": voice.get("user_sentiment","") if has_voice else "",
-            "agent_wpm": acoustic.get("agent_wpm","") if acoustic else "",
-            "user_wpm": acoustic.get("user_wpm","") if acoustic else "",
-            "avg_turn_gap_s": acoustic.get("avg_turn_gap_s","") if acoustic else "",
-            "max_turn_gap_s": acoustic.get("max_turn_gap_s","") if acoustic else "",
-            "long_pauses": acoustic.get("long_pauses","") if acoustic else "",
-            "avg_agent_word_duration_ms": acoustic.get("avg_agent_word_duration_ms","") if acoustic else "",
+            "agent_wpm":      voice.get("agent_wpm", "")       if has_voice else "",
+            "avg_turn_gap_s": voice.get("avg_turn_gap_s", "")  if has_voice else "",
+            "long_pauses":    voice.get("long_pauses", "")     if has_voice else "",
+            "qa_voz":         voice.get("voice_qa_reasoning", "") if has_voice else "",
+            "sentimiento":    voice.get("user_sentiment", "")  if has_voice else (r.get("sentimiento") or {}).get("estado", ""),
         })
 
     if csv_rows:
         st.divider()
-        st.download_button("⬇️ Exportar CSV", to_csv(csv_rows),
-            f"auditoria_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", "text/csv", type="primary")
+        st.download_button(
+            "⬇️ Exportar CSV",
+            to_csv(csv_rows),
+            f"auditoria_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            "text/csv",
+            type="primary"
+        )
