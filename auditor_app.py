@@ -620,7 +620,7 @@ with tab1:
 
         prog.progress(1.0, text=f"✅ {len(ids)} llamadas evaluadas!")
         st.balloons()
-        st.info("👉 Revisa los resultados en la pestaña **Resultados**.")
+        st.rerun()
 
 # ── TAB 2 ─────────────────────────────────────────────────────
 with tab2:
