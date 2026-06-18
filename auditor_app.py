@@ -620,11 +620,16 @@ with tab1:
 
         prog.progress(1.0, text=f"✅ {len(ids)} llamadas evaluadas!")
         st.balloons()
-        st.rerun()
+        st.info("👉 Revisa los resultados en la pestaña **Resultados**.")
 
 # ── TAB 2 ─────────────────────────────────────────────────────
 with tab2:
-    res = {k: v for k, v in st.session_state.audit_results.items() if v.get("status") == "done"}
+    all_results = st.session_state.audit_results
+    res = {k: v for k, v in all_results.items() if v.get("status") == "done"}
+    errors = {k: v for k, v in all_results.items() if v.get("status") == "error"}
+    if errors:
+        for cid_err, err_data in errors.items():
+            st.error(f"❌ `{cid_err[:30]}` — {err_data.get('error', 'Error desconocido')}")
     if not res:
         st.info("Ninguna auditoría realizada aún.")
         st.stop()
