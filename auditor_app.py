@@ -125,7 +125,7 @@ def api_req_raw(url, headers):
         raise Exception(f"HTTP {e.code} fetching audio")
 
 def fetch_agents(el_key):
-    data = api_req("https://api.elevenlabs.io/v1/convai/agents?page_size=50", {"xi-api-key": el_key})
+    data = api_req("https://api.elevenlabs.io/v1/convai/agents?page_size=100", {"xi-api-key": el_key})
     return data.get("agents", [])
 
 def fetch_agent_prompt(el_key, agent_id):
